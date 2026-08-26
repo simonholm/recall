@@ -1,0 +1,10 @@
+/target/
+
+# Local tool settings
+/.claude/settings.local.json
+
+# Local Recall audit/output artifacts
+/recall-output*
+
+# Timestamped AI/export transcript files
+/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-*.txt

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "eventref-rationale",
+      "question": "Why did I introduce EventRef?",
+      "as_of": "2026-07-20T12:51:00Z",
+      "expected_facts": [
+        {
+          "name": "EventRef is source-qualified",
+          "phrases": [
+            "source-qualified eventref",
+            "source-qualified events",
+            "source-qualified references"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "git-adapter-implementation",
+      "question": "When did I implement the Git adapter?",
+      "expected_facts": [
+        {
+          "name": "Git adapter maps commit history",
+          "phrases": [
+            "git adapter",
+            "commit history"
+          ]
+        }
+      ]
+    }
+  ]
+}

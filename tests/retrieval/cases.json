@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "eventref-rationale",
+      "question": "Why did I introduce EventRef?",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-eventref",
+          "max_rank": 5,
+          "why": "The Codex session discusses replacing embedded events with source-qualified references."
+        },
+        {
+          "source": "git",
+          "id": "fixture-git-eventref",
+          "max_rank": 1,
+          "why": "The commit records the landed core model change."
+        }
+      ],
+      "notes": "A lexical query should find durable terms such as eventref and introduce."
+    },
+    {
+      "id": "git-adapter-implementation",
+      "question": "When did I implement the Git adapter?",
+      "expected": [
+        {
+          "source": "git",
+          "id": "fixture-git-adapter",
+          "max_rank": 5,
+          "why": "The Git commit describes adding Git history as a source adapter."
+        },
+        {
+          "source": "codex",
+          "id": "fixture-codex-git-adapter",
+          "max_rank": 5,
+          "why": "The Codex session contains the implementation discussion for the Git adapter."
+        }
+      ],
+      "notes": "This should continue to work with current keyword retrieval."
+    },
+    {
+      "id": "inspect-missing-id",
+      "question": "How should recall inspect behave when an event id is missing?",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-inspect-missing",
+          "max_rank": 5,
+          "why": "The session records the explicit missing-id error contract for inspect."
+        }
+      ],
+      "notes": "The important evidence is behavioral, not just the word inspect."
+    },
+    {
+      "id": "today-recall-work",
+      "question": "Summarize today's recall work.",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-recall-today",
+          "max_rank": 5,
+          "why": "The session is timestamped today and belongs to the recall project."
+        },
+        {
+          "source": "git",
+          "id": "fixture-git-recall-today",
+          "max_rank": 5,
+          "why": "The commit is today's recall change."
+        }
+      ],
+      "notes": "This is expected to expose the current lexical pipeline weakness; today and summarize should not become required search terms in a future planner."
+    },
+    {
+      "id": "recent-work",
+      "question": "What have I been working on recently?",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-recent-work",
+          "max_rank": 5,
+          "why": "The event is in the recent fixture window."
+        }
+      ],
+      "notes": "This temporal question should be measured before introducing recency-aware retrieval."
+    }
+  ]
+}
