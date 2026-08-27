@@ -9,7 +9,7 @@ mod openrouter;
 mod outbound_audit;
 
 use clap::{Parser, Subcommand};
-use openrouter::{LlmDiagnostics, OpenRouterConfig};
+use openrouter::{AuthStatus, LlmDiagnostics, OpenRouterConfig};
 use outbound_audit::OutboundAuditConfig;
 use recall_codex::CodexAdapter;
 use recall_core::{
@@ -18,6 +18,8 @@ use recall_core::{
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
+use std::fs::File;
+use std::io::{self, BufRead, Write as IoWrite};
 use std::process::ExitCode;
 
 const ASK_RESULT_LIMIT: usize = 8;
@@ -34,6 +36,11 @@ struct Cli {
 /// Recall command set.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage OpenRouter authentication.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Build an experimental answer prompt from retrieved memory.
     Ask {
         /// Append OpenRouter response diagnostics when available.
@@ -65,6 +72,16 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Store an OpenRouter API key for future Recall runs.
+    Login,
+    /// Show whether OpenRouter authentication is configured.
+    Status,
+    /// Remove Recall's stored OpenRouter API key.
+    Logout,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let recall = default_recall();
@@ -86,6 +103,11 @@ fn default_recall() -> Recall {
 
 fn run(cli: Cli, recall: &Recall) -> Result<(), String> {
     match cli.command {
+        Command::Auth { command } => match command {
+            AuthCommand::Login => auth_login(),
+            AuthCommand::Status => auth_status(),
+            AuthCommand::Logout => auth_logout(),
+        }?,
         Command::Ask {
             diagnostics,
             debug_query,
@@ -140,6 +162,120 @@ fn run(cli: Cli, recall: &Recall) -> Result<(), String> {
     Ok(())
 }
 
+fn auth_login() -> Result<(), String> {
+    let api_key = read_secret("OpenRouter API key: ")?;
+    let path = openrouter::save_api_key_from_env_home(&api_key)?;
+    println!("OpenRouter credential stored at {}", path.display());
+    Ok(())
+}
+
+fn auth_status() -> Result<(), String> {
+    print!(
+        "{}",
+        format_auth_status(openrouter::auth_status_from_env())?
+    );
+    Ok(())
+}
+
+fn format_auth_status(status: AuthStatus) -> Result<String, String> {
+    match status {
+        AuthStatus::EnvironmentOverride => {
+            Ok("OpenRouter authentication: configured from OPENROUTER_API_KEY\n".to_string())
+        }
+        AuthStatus::Stored { path } => {
+            Ok(format!(
+                "OpenRouter authentication: configured at {}",
+                path.display()
+            ))
+            .map(|line| format!("{line}\n"))
+        }
+        AuthStatus::NotConfigured { path } => {
+            Ok(format!(
+                "OpenRouter authentication: not configured; run `recall auth login` to store a credential at {}",
+                path.display()
+            ))
+            .map(|line| format!("{line}\n"))
+        }
+        AuthStatus::Error(error) => Err(error),
+    }
+}
+
+fn auth_logout() -> Result<(), String> {
+    match openrouter::delete_api_key_from_env_home()? {
+        Some(path) => println!("OpenRouter credential removed from {}", path.display()),
+        None => println!("OpenRouter credential was not stored by Recall"),
+    }
+    Ok(())
+}
+
+fn read_secret(prompt: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        read_secret_from_tty(prompt)
+    }
+    #[cfg(not(unix))]
+    {
+        print!("{prompt}");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("failed to write prompt: {error}"))?;
+        let mut secret = String::new();
+        io::stdin()
+            .read_line(&mut secret)
+            .map_err(|error| format!("failed to read OpenRouter API key: {error}"))?;
+        Ok(secret.trim().to_string())
+    }
+}
+
+#[cfg(unix)]
+fn read_secret_from_tty(prompt: &str) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+
+    let mut tty = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| format!("failed to open terminal: {error}"))?;
+    tty.write_all(prompt.as_bytes())
+        .and_then(|_| tty.flush())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+
+    let tty_for_stty = tty
+        .try_clone()
+        .map_err(|error| format!("failed to configure terminal: {error}"))?;
+    let status = Command::new("stty")
+        .arg("-echo")
+        .stdin(Stdio::from(tty_for_stty))
+        .status()
+        .map_err(|error| format!("failed to disable terminal echo: {error}"))?;
+    if !status.success() {
+        return Err("failed to disable terminal echo".to_string());
+    }
+
+    let mut secret = String::new();
+    let read_result = io::BufReader::new(
+        tty.try_clone()
+            .map_err(|error| format!("failed to read terminal: {error}"))?,
+    )
+    .read_line(&mut secret);
+
+    let tty_for_stty = tty
+        .try_clone()
+        .map_err(|error| format!("failed to restore terminal echo: {error}"))?;
+    let restore_status = Command::new("stty")
+        .arg("echo")
+        .stdin(Stdio::from(tty_for_stty))
+        .status()
+        .map_err(|error| format!("failed to restore terminal echo: {error}"))?;
+    writeln!(tty).map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !restore_status.success() {
+        return Err("failed to restore terminal echo".to_string());
+    }
+
+    read_result.map_err(|error| format!("failed to read OpenRouter API key: {error}"))?;
+    Ok(secret.trim().to_string())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DebugOptions {
     query: bool,
@@ -189,6 +325,10 @@ fn ask_output_with_audit(
             &prompt
         )
     );
+
+    if let Some(error) = openrouter_config.credential_error() {
+        return Err(error.to_string());
+    }
 
     if !openrouter_config.is_configured() {
         return Ok(format!(
@@ -824,6 +964,37 @@ mod tests {
         assert!(debug_query);
         assert!(debug_search);
         assert!(debug_prompt);
+    }
+
+    #[test]
+    fn auth_subcommands_are_accepted() {
+        for subcommand in ["login", "status", "logout"] {
+            let cli = Cli::try_parse_from(["recall", "auth", subcommand]).unwrap();
+            let Command::Auth { command } = cli.command else {
+                panic!("expected auth command");
+            };
+            match (subcommand, command) {
+                ("login", AuthCommand::Login)
+                | ("status", AuthCommand::Status)
+                | ("logout", AuthCommand::Logout) => {}
+                _ => panic!("unexpected auth subcommand"),
+            }
+        }
+    }
+
+    #[test]
+    fn auth_status_output_does_not_expose_secret_values() {
+        let output = format_auth_status(AuthStatus::Stored {
+            path: "/tmp/recall-auth-test/auth.json".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "OpenRouter authentication: configured at /tmp/recall-auth-test/auth.json\n"
+        );
+        assert!(!output.contains("secret-key-value"));
+        assert!(!output.contains("Bearer"));
     }
 
     #[test]

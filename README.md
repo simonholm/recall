@@ -131,8 +131,21 @@ recall ask "When did I implement timeline?"
 `recall ask` plans retrieval, searches or reads the timeline from supported
 sources, inspects matching events, compiles evidence, and builds a prompt. For
 explicit single-day questions, it keeps all matching events for that day before
-compilation. If `OPENROUTER_API_KEY` is unset, it prints the prompt. If the key
-is set, it sends the prompt to OpenRouter and prints the answer.
+compilation. If `OPENROUTER_API_KEY` is set, it sends the prompt to OpenRouter
+with that key. Otherwise, Recall loads a stored OpenRouter key from
+`~/.local/share/recall/auth.json`. If neither credential exists, it prints the
+prompt instead of sending it.
+
+Store an OpenRouter key once for future SSH sessions:
+
+```sh
+recall auth login
+recall auth status
+```
+
+Recall creates `~/.local/share/recall/auth.json` outside the repository with
+user-only file permissions. `OPENROUTER_API_KEY` remains the highest-priority
+override. Remove the stored credential with `recall auth logout`.
 
 The `Evidence:` section in this output lists the compiled `EvidenceBlock`s
 produced by `ContextCompiler` — the same evidence used to build the prompt —

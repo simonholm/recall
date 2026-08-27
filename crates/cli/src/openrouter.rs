@@ -7,7 +7,9 @@
 //! inference engines such as OpenAI, Anthropic, Gemini, Ollama, and llama.cpp.
 
 use std::fmt;
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -16,11 +18,13 @@ pub(crate) const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_AUTH_PATH: &str = ".local/share/recall/auth.json";
 const MAX_RESPONSE_BODY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpenRouterConfig {
     api_key: Option<String>,
+    credential_error: Option<String>,
     model: String,
     endpoint: String,
     transport: TransportConfig,
@@ -28,11 +32,28 @@ pub(crate) struct OpenRouterConfig {
 
 impl OpenRouterConfig {
     pub(crate) fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::from_lookup_and_home(|key| std::env::var(key).ok(), home.as_deref())
     }
 
+    #[cfg(test)]
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
-        let api_key = lookup("OPENROUTER_API_KEY").and_then(non_empty);
+        Self::from_lookup_and_home(&mut lookup, None)
+    }
+
+    fn from_lookup_and_home(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        home: Option<&Path>,
+    ) -> Self {
+        let explicit_api_key = lookup("OPENROUTER_API_KEY").and_then(non_empty);
+        let (api_key, credential_error) = match explicit_api_key {
+            Some(api_key) => (Some(api_key), None),
+            None => match home.map(load_stored_api_key) {
+                Some(Ok(api_key)) => (api_key, None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
+            },
+        };
         let model = lookup("RECALL_OPENROUTER_MODEL")
             .and_then(non_empty)
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
@@ -43,6 +64,7 @@ impl OpenRouterConfig {
 
         Self {
             api_key,
+            credential_error,
             model,
             endpoint,
             transport,
@@ -51,6 +73,10 @@ impl OpenRouterConfig {
 
     pub(crate) fn is_configured(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    pub(crate) fn credential_error(&self) -> Option<&str> {
+        self.credential_error.as_deref()
     }
 
     pub(crate) fn model(&self) -> &str {
@@ -79,6 +105,7 @@ impl OpenRouterConfig {
     ) -> Self {
         Self {
             api_key,
+            credential_error: None,
             model,
             endpoint,
             transport: TransportConfig::with_all_timeouts(timeout_secs),
@@ -86,9 +113,255 @@ impl OpenRouterConfig {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AuthStatus {
+    EnvironmentOverride,
+    Stored { path: PathBuf },
+    NotConfigured { path: PathBuf },
+    Error(String),
+}
+
+pub(crate) fn auth_status_from_env() -> AuthStatus {
+    if std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .and_then(non_empty)
+        .is_some()
+    {
+        return AuthStatus::EnvironmentOverride;
+    }
+
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return AuthStatus::Error("HOME is not set".to_string());
+    };
+    auth_status_from_home(&home)
+}
+
+#[cfg(test)]
+fn auth_status_from_lookup_and_home(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+    home: &Path,
+) -> AuthStatus {
+    if lookup("OPENROUTER_API_KEY").and_then(non_empty).is_some() {
+        return AuthStatus::EnvironmentOverride;
+    }
+
+    auth_status_from_home(home)
+}
+
+fn auth_status_from_home(home: &Path) -> AuthStatus {
+    let path = auth_path(home);
+    match load_auth_record(&path) {
+        Ok(Some(_)) => AuthStatus::Stored { path },
+        Ok(None) => AuthStatus::NotConfigured { path },
+        Err(error) => AuthStatus::Error(error),
+    }
+}
+
+pub(crate) fn save_api_key_from_env_home(api_key: &str) -> Result<PathBuf, String> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Err("HOME is not set".to_string());
+    };
+    save_api_key(&home, api_key)
+}
+
+pub(crate) fn delete_api_key_from_env_home() -> Result<Option<PathBuf>, String> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Err("HOME is not set".to_string());
+    };
+    delete_api_key(&home)
+}
+
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+fn auth_path(home: &Path) -> PathBuf {
+    home.join(DEFAULT_AUTH_PATH)
+}
+
+fn load_stored_api_key(home: &Path) -> Result<Option<String>, String> {
+    load_auth_record(&auth_path(home))
+}
+
+fn load_auth_record(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "openrouter credential file could not be read: {}; {error}",
+                path.display()
+            ));
+        }
+    };
+    if !credential_permissions_are_private(&metadata) {
+        return Err(format!(
+            "openrouter credential file has insecure permissions: {}; expected mode 0600",
+            path.display()
+        ));
+    }
+
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "openrouter credential file could not be read: {}; {error}",
+            path.display()
+        )
+    })?;
+
+    parse_auth_json(&contents)
+        .ok_or_else(|| {
+            format!(
+                "openrouter credential is not configured in {}; expected openrouter_api_key",
+                path.display()
+            )
+        })
+        .map(Some)
+}
+
+fn save_api_key(home: &Path, api_key: &str) -> Result<PathBuf, String> {
+    let api_key = non_empty(api_key.to_string())
+        .ok_or_else(|| "openrouter API key cannot be empty".to_string())?;
+    let path = auth_path(home);
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("invalid auth path: {}", path.display()))?;
+    fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "openrouter credential directory could not be created: {}; {error}",
+            directory.display()
+        )
+    })?;
+    set_directory_private(directory)?;
+
+    let contents = serde_json::to_string_pretty(&json!({ "openrouter_api_key": api_key }))
+        .map_err(|error| format!("openrouter credential could not be encoded: {error}"))?;
+    write_private_file(&path, format!("{contents}\n").as_bytes())?;
+    Ok(path)
+}
+
+fn delete_api_key(home: &Path) -> Result<Option<PathBuf>, String> {
+    let path = auth_path(home);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "openrouter credential file could not be removed: {}; {error}",
+            path.display()
+        )),
+    }
+}
+
+fn parse_auth_json(contents: &str) -> Option<String> {
+    serde_json::from_str::<Value>(contents)
+        .ok()?
+        .get("openrouter_api_key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .and_then(non_empty)
+}
+
+#[cfg(unix)]
+fn set_directory_private(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("could not inspect {}; {error}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("could not set permissions on {}; {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_directory_private(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("invalid auth path: {}", path.display()))?;
+    let temp_path = directory.join(format!(
+        ".auth.json.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temp_path)
+        .map_err(|error| {
+            format!(
+                "openrouter credential file could not be written: {}; {error}",
+                temp_path.display()
+            )
+        })?;
+    if let Err(error) = file.write_all(contents) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "openrouter credential file could not be written: {}; {error}",
+            temp_path.display()
+        ));
+    }
+    if let Err(error) = file.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "openrouter credential file could not be written: {}; {error}",
+            temp_path.display()
+        ));
+    }
+
+    let mut permissions = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {}; {error}", temp_path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    if let Err(error) = file.set_permissions(permissions) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "could not set permissions on {}; {error}",
+            temp_path.display()
+        ));
+    }
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "openrouter credential file could not be written: {}; {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    fs::write(path, contents).map_err(|error| {
+        format!(
+            "openrouter credential file could not be written: {}; {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn credential_permissions_are_private(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o777 == 0o600
+}
+
+#[cfg(not(unix))]
+fn credential_permissions_are_private(_metadata: &fs::Metadata) -> bool {
+    true
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -719,6 +992,153 @@ mod tests {
     }
 
     #[test]
+    fn config_loads_stored_api_key_when_environment_is_absent() {
+        let home = temp_home("stored-api-key");
+        write_stored_key(&home, " file-key ");
+
+        let config = OpenRouterConfig::from_lookup_and_home(|_| None, Some(&home));
+
+        assert_eq!(config.api_key.as_deref(), Some("file-key"));
+        assert!(config.is_configured());
+    }
+
+    #[test]
+    fn config_environment_api_key_overrides_stored_api_key() {
+        let home = temp_home("stored-api-key-override");
+        write_stored_key(&home, "file-key");
+
+        let config = OpenRouterConfig::from_lookup_and_home(
+            |key| (key == "OPENROUTER_API_KEY").then(|| "env-key".to_string()),
+            Some(&home),
+        );
+
+        assert_eq!(config.api_key.as_deref(), Some("env-key"));
+    }
+
+    #[test]
+    fn config_reports_stored_api_key_with_insecure_permissions() {
+        let home = temp_home("stored-api-key-insecure");
+        let path = write_stored_key(&home, "file-key");
+        set_mode(&path, 0o644);
+
+        let config = OpenRouterConfig::from_lookup_and_home(|_| None, Some(&home));
+
+        assert_eq!(config.api_key, None);
+        assert!(!config.is_configured());
+        assert!(config
+            .credential_error()
+            .unwrap()
+            .contains("expected mode 0600"));
+    }
+
+    #[test]
+    fn config_reports_malformed_stored_api_key() {
+        let missing_home = temp_home("stored-api-key-missing");
+        let missing_config = OpenRouterConfig::from_lookup_and_home(|_| None, Some(&missing_home));
+        assert_eq!(missing_config.api_key, None);
+        assert_eq!(missing_config.credential_error(), None);
+
+        let malformed_home = temp_home("stored-api-key-malformed");
+        write_auth_json(&malformed_home, "{}\n");
+        let malformed_config =
+            OpenRouterConfig::from_lookup_and_home(|_| None, Some(&malformed_home));
+        assert_eq!(malformed_config.api_key, None);
+        assert!(malformed_config
+            .credential_error()
+            .unwrap()
+            .contains("expected openrouter_api_key"));
+    }
+
+    #[test]
+    fn auth_json_parser_loads_key_without_exposing_it() {
+        assert_eq!(
+            parse_auth_json(r#"{"openrouter_api_key":"stored-key"}"#).as_deref(),
+            Some("stored-key")
+        );
+        assert_eq!(parse_auth_json(r#"{"openrouter_api_key":""}"#), None);
+        assert_eq!(parse_auth_json("not json"), None);
+    }
+
+    #[test]
+    fn auth_status_reports_environment_precedence_without_reading_stored_key() {
+        let home = temp_home("status-env-override");
+        write_stored_key(&home, "file-key");
+
+        let status = auth_status_from_lookup_and_home(
+            |key| (key == "OPENROUTER_API_KEY").then(|| "env-key".to_string()),
+            &home,
+        );
+
+        assert_eq!(status, AuthStatus::EnvironmentOverride);
+    }
+
+    #[test]
+    fn auth_status_reports_stored_missing_and_malformed_credentials() {
+        let stored_home = temp_home("status-stored");
+        let stored_path = write_stored_key(&stored_home, "file-key");
+        assert_eq!(
+            auth_status_from_lookup_and_home(|_| None, &stored_home),
+            AuthStatus::Stored { path: stored_path }
+        );
+
+        let missing_home = temp_home("status-missing");
+        assert_eq!(
+            auth_status_from_lookup_and_home(|_| None, &missing_home),
+            AuthStatus::NotConfigured {
+                path: auth_path(&missing_home)
+            }
+        );
+
+        let malformed_home = temp_home("status-malformed");
+        write_auth_json(&malformed_home, "not json");
+        let status = auth_status_from_lookup_and_home(|_| None, &malformed_home);
+        assert!(
+            matches!(status, AuthStatus::Error(error) if error.contains("expected openrouter_api_key"))
+        );
+    }
+
+    #[test]
+    fn save_api_key_writes_private_user_state_file() {
+        let home = temp_home("save-private");
+
+        let path = save_api_key(&home, " stored-key ").unwrap();
+
+        assert_eq!(path, auth_path(&home));
+        assert_eq!(
+            load_auth_record(&path).unwrap().as_deref(),
+            Some("stored-key")
+        );
+        assert!(credential_permissions_are_private(
+            &fs::metadata(&path).unwrap()
+        ));
+        assert_eq!(file_mode(&path), 0o600);
+        assert_eq!(file_mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn save_api_key_replaces_existing_file_atomically_and_privately() {
+        let home = temp_home("save-replace");
+        let path = write_stored_key(&home, "old-key");
+        set_mode(&path, 0o644);
+
+        let saved_path = save_api_key(&home, "new-key").unwrap();
+
+        assert_eq!(saved_path, path);
+        assert_eq!(load_auth_record(&path).unwrap().as_deref(), Some("new-key"));
+        assert_eq!(file_mode(&path), 0o600);
+    }
+
+    #[test]
+    fn delete_api_key_removes_stored_credential_only_when_present() {
+        let home = temp_home("delete-key");
+        let path = write_stored_key(&home, "file-key");
+
+        assert_eq!(delete_api_key(&home).unwrap(), Some(path.clone()));
+        assert!(!path.exists());
+        assert_eq!(delete_api_key(&home).unwrap(), None);
+    }
+
+    #[test]
     fn config_reports_whether_endpoint_is_default() {
         let default_config = OpenRouterConfig::from_lookup(|_| None);
         let custom_config = OpenRouterConfig::from_lookup(|key| match key {
@@ -983,6 +1403,7 @@ mod tests {
 
         let config = OpenRouterConfig {
             api_key: Some("test-key".to_string()),
+            credential_error: None,
             model: "test-model".to_string(),
             endpoint,
             transport: TransportConfig::with_all_timeouts(5),
@@ -1025,6 +1446,7 @@ mod tests {
 
         let config = OpenRouterConfig {
             api_key: Some("test-key".to_string()),
+            credential_error: None,
             model: "test-model".to_string(),
             endpoint,
             transport: TransportConfig::with_all_timeouts(5),
@@ -1063,6 +1485,7 @@ mod tests {
 
         let config = OpenRouterConfig {
             api_key: Some("test-key".to_string()),
+            credential_error: None,
             model: "test-model".to_string(),
             endpoint,
             transport: TransportConfig {
@@ -1162,5 +1585,51 @@ mod tests {
         }
 
         decoded
+    }
+
+    fn temp_home(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("recall-openrouter-{label}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_stored_key(home: &Path, key: &str) -> PathBuf {
+        write_auth_json(home, &format!("{{\"openrouter_api_key\":\"{key}\"}}\n"))
+    }
+
+    fn write_auth_json(home: &Path, contents: &str) -> PathBuf {
+        let path = home.join(DEFAULT_AUTH_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        set_mode(&path, 0o600);
+        path
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_path: &Path, _mode: u32) {}
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(not(unix))]
+    fn file_mode(_path: &Path) -> u32 {
+        0o600
     }
 }
