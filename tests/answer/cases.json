@@ -29,6 +29,54 @@
           ]
         }
       ]
+    },
+    {
+      "id": "retrieval-planner-rationale",
+      "question": "Why does Recall need a Retrieval Planner?",
+      "as_of": "2026-08-02T15:31:00Z",
+      "expected_facts": [
+        {
+          "name": "Recall needs a Retrieval Planner because natural questions are retrieval-planning problems",
+          "phrases": [
+            "retrieval-planning problem",
+            "not an LLM problem",
+            "summarize todays recall work",
+            "zero matches"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "context-compiler-project-handoff",
+      "question": "What should the Context Compiler produce?",
+      "as_of": "2026-08-04T10:39:00Z",
+      "expected_facts": [
+        {
+          "name": "The Context Compiler should produce a deterministic project handoff",
+          "phrases": [
+            "deterministic project handoff",
+            "compact state",
+            "avoid replaying entire development sessions",
+            "planned next step"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "august-26-clean-slate-handover",
+      "question": "What happened to Recall on August 26, 2026?",
+      "as_of": "2026-08-26T23:59:59Z",
+      "expected_facts": [
+        {
+          "name": "Recall was handed over to the clean-slate root implementation",
+          "phrases": [
+            "Initial Recall implementation",
+            "a5c93c7",
+            "clean repository",
+            "source of truth"
+          ]
+        }
+      ]
     }
   ]
 }

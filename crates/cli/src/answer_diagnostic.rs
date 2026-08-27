@@ -9,6 +9,7 @@ use recall_core::{
 };
 use serde_json::Value;
 use std::fmt::Write;
+use std::io;
 
 const ANSWER_CASES_JSON: &str = include_str!("../../../tests/answer/cases.json");
 
@@ -32,6 +33,7 @@ struct AskDiagnosticObservation {
     question: String,
     prompt: String,
     answer: Option<String>,
+    answer_error: Option<String>,
     facts: Vec<FactObservation>,
 }
 
@@ -158,6 +160,27 @@ fn run_answer_diagnostics(
         .collect()
 }
 
+fn run_live_answer_diagnostics(
+    recall: &Recall,
+    cases: &[AnswerEvalCase],
+    mut progress: impl io::Write,
+    mut answerer: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Vec<AskDiagnosticObservation>, String> {
+    let mut observations = Vec::new();
+
+    for case in cases {
+        let prompt = build_actual_ask_prompt(recall, case)?;
+        writeln!(progress, "Running answer diagnostic: {}", case.id)
+            .map_err(|error| error.to_string())?;
+        writeln!(progress, "  {}", case.question).map_err(|error| error.to_string())?;
+        progress.flush().map_err(|error| error.to_string())?;
+
+        observations.push(observe_live_answer_case(case, prompt, &mut answerer));
+    }
+
+    Ok(observations)
+}
+
 fn observe_answer_case(
     recall: &Recall,
     case: &AnswerEvalCase,
@@ -176,8 +199,34 @@ fn observe_answer_case(
         question: case.question.clone(),
         prompt,
         answer,
+        answer_error: None,
         facts,
     })
+}
+
+fn observe_live_answer_case(
+    case: &AnswerEvalCase,
+    prompt: String,
+    answerer: &mut impl FnMut(&str) -> Result<Option<String>, String>,
+) -> AskDiagnosticObservation {
+    let (answer, answer_error) = match answerer(&prompt) {
+        Ok(answer) => (answer, None),
+        Err(error) => (None, Some(error)),
+    };
+    let facts = case
+        .expected_facts
+        .iter()
+        .map(|fact| observe_fact(fact, &prompt, answer.as_deref()))
+        .collect();
+
+    AskDiagnosticObservation {
+        case_id: case.id.clone(),
+        question: case.question.clone(),
+        prompt,
+        answer,
+        answer_error,
+        facts,
+    }
 }
 
 fn build_actual_ask_prompt(recall: &Recall, case: &AnswerEvalCase) -> Result<String, String> {
@@ -288,6 +337,9 @@ fn format_answer_diagnostic_report(observations: &[AskDiagnosticObservation]) ->
     for observation in observations {
         writeln!(output, "Question: {}", observation.case_id).unwrap();
         writeln!(output, "  {}", observation.question).unwrap();
+        if let Some(error) = &observation.answer_error {
+            writeln!(output, "  Error: {error}").unwrap();
+        }
         for fact in &observation.facts {
             writeln!(
                 output,
@@ -332,6 +384,7 @@ fn format_answer_diagnostic_report(observations: &[AskDiagnosticObservation]) ->
         summary.answer_not_run
     )
     .unwrap();
+    writeln!(output, "Answer errors          : {}", summary.answer_errors).unwrap();
 
     output
 }
@@ -366,6 +419,7 @@ struct AnswerDiagnosticSummary {
     retrieval_compiler_misses: usize,
     suspicious_unsupported: usize,
     answer_not_run: usize,
+    answer_errors: usize,
 }
 
 impl AnswerDiagnosticSummary {
@@ -385,6 +439,10 @@ impl AnswerDiagnosticSummary {
                 FactClassification::AnswerNotRun => summary.answer_not_run += 1,
             }
         }
+        summary.answer_errors = observations
+            .iter()
+            .filter(|observation| observation.answer_error.is_some())
+            .count();
 
         summary
     }
@@ -451,7 +509,7 @@ fn answer_eval_fixture_recall() -> Recall {
 fn answer_eval_cases_load_from_separate_corpus() {
     let cases = load_answer_eval_cases(ANSWER_CASES_JSON).unwrap();
 
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 5);
     assert_eq!(cases[0].id, "eventref-rationale");
     assert_eq!(
         cases[0].as_of.unwrap().to_rfc3339(),
@@ -468,6 +526,21 @@ fn answer_eval_cases_load_from_separate_corpus() {
             "source-qualified events".to_string(),
             "source-qualified references".to_string()
         ]
+    );
+    assert_eq!(cases[2].id, "retrieval-planner-rationale");
+    assert_eq!(
+        cases[2].as_of.unwrap().to_rfc3339(),
+        "2026-08-02T15:31:00+00:00"
+    );
+    assert_eq!(cases[3].id, "context-compiler-project-handoff");
+    assert_eq!(
+        cases[3].as_of.unwrap().to_rfc3339(),
+        "2026-08-04T10:39:00+00:00"
+    );
+    assert_eq!(cases[4].id, "august-26-clean-slate-handover");
+    assert_eq!(
+        cases[4].as_of.unwrap().to_rfc3339(),
+        "2026-08-26T23:59:59+00:00"
     );
 }
 
@@ -695,6 +768,7 @@ fn answer_diagnostic_report_is_compact_and_summarizes_classes() {
         question: "What happened?".to_string(),
         prompt: "prompt".to_string(),
         answer: Some("answer".to_string()),
+        answer_error: None,
         facts: vec![
             FactObservation {
                 name: "present".to_string(),
@@ -720,6 +794,161 @@ fn answer_diagnostic_report_is_compact_and_summarizes_classes() {
     assert!(report.contains("Facts                  : 2"));
     assert!(report.contains("Success                : 1"));
     assert!(report.contains("Synthesis misses       : 1"));
+    assert!(report.contains("Answer errors          : 0"));
+}
+
+#[test]
+fn live_answer_diagnostic_prints_progress_before_answerer_invocation() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct SharedProgress {
+        output: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl io::Write for SharedProgress {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let recall = answer_eval_fixture_recall();
+    let cases = vec![AnswerEvalCase {
+        id: "eventref".to_string(),
+        question: "Why did I introduce EventRef?".to_string(),
+        as_of: None,
+        expected_facts: vec![ExpectedFact {
+            name: "EventRef is source-qualified".to_string(),
+            phrases: vec!["source-qualified eventref".to_string()],
+        }],
+    }];
+    let progress_output = Rc::new(RefCell::new(Vec::new()));
+    let progress = SharedProgress {
+        output: Rc::clone(&progress_output),
+    };
+
+    let observations = run_live_answer_diagnostics(&recall, &cases, progress, |_| {
+        let output = String::from_utf8(progress_output.borrow().clone()).unwrap();
+        assert!(output.contains("Running answer diagnostic: eventref"));
+        assert!(output.contains("  Why did I introduce EventRef?"));
+        Ok(Some(
+            "You introduced source-qualified EventRef handles.".to_string(),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(observations.len(), 1);
+}
+
+#[test]
+fn live_answer_diagnostic_continues_after_answerer_error() {
+    let recall = answer_eval_fixture_recall();
+    let cases = vec![
+        AnswerEvalCase {
+            id: "first".to_string(),
+            question: "Why did I introduce EventRef?".to_string(),
+            as_of: None,
+            expected_facts: vec![ExpectedFact {
+                name: "EventRef is source-qualified".to_string(),
+                phrases: vec!["source-qualified eventref".to_string()],
+            }],
+        },
+        AnswerEvalCase {
+            id: "second".to_string(),
+            question: "Why did I introduce EventRef?".to_string(),
+            as_of: None,
+            expected_facts: vec![ExpectedFact {
+                name: "EventRef is source-qualified".to_string(),
+                phrases: vec!["source-qualified eventref".to_string()],
+            }],
+        },
+    ];
+    let mut calls = 0;
+
+    let observations = run_live_answer_diagnostics(&recall, &cases, Vec::new(), |_| {
+        calls += 1;
+        if calls == 1 {
+            Err("openrouter request timed out: receive response".to_string())
+        } else {
+            Ok(Some(
+                "You introduced source-qualified EventRef handles.".to_string(),
+            ))
+        }
+    })
+    .unwrap();
+
+    assert_eq!(calls, 2);
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations[0].answer_error.as_deref(),
+        Some("openrouter request timed out: receive response")
+    );
+    assert_eq!(observations[1].answer_error, None);
+    assert_eq!(
+        observations[1].facts[0].classification,
+        FactClassification::Success
+    );
+}
+
+#[test]
+fn live_answer_diagnostic_represents_provider_error_as_answer_not_run() {
+    let recall = answer_eval_fixture_recall();
+    let cases = vec![AnswerEvalCase {
+        id: "timeout".to_string(),
+        question: "Why did I introduce EventRef?".to_string(),
+        as_of: None,
+        expected_facts: vec![ExpectedFact {
+            name: "EventRef is source-qualified".to_string(),
+            phrases: vec!["source-qualified eventref".to_string()],
+        }],
+    }];
+
+    let observations = run_live_answer_diagnostics(&recall, &cases, Vec::new(), |_| {
+        Err("openrouter request timed out: receive response".to_string())
+    })
+    .unwrap();
+    let report = format_answer_diagnostic_report(&observations);
+
+    assert_eq!(
+        observations[0].facts[0].classification,
+        FactClassification::AnswerNotRun
+    );
+    assert!(report.contains("Error: openrouter request timed out: receive response"));
+    assert!(
+        report.contains("- EventRef is source-qualified: evidence=yes answer=n/a answer not run")
+    );
+    assert!(report.contains("Synthesis misses       : 0"));
+    assert!(report.contains("Retrieval/compiler miss: 0"));
+    assert!(report.contains("Answer errors          : 1"));
+}
+
+#[test]
+fn deterministic_answer_diagnostic_still_returns_answerer_errors() {
+    let recall = answer_eval_fixture_recall();
+    let cases = vec![AnswerEvalCase {
+        id: "eventref".to_string(),
+        question: "Why did I introduce EventRef?".to_string(),
+        as_of: None,
+        expected_facts: vec![ExpectedFact {
+            name: "EventRef is source-qualified".to_string(),
+            phrases: vec!["source-qualified eventref".to_string()],
+        }],
+    }];
+
+    let error =
+        run_answer_diagnostics(
+            &recall,
+            &cases,
+            |_| Err("deterministic failure".to_string()),
+        )
+        .unwrap_err();
+
+    assert_eq!(error, "deterministic failure");
 }
 
 #[test]
@@ -732,7 +961,7 @@ fn answer_diagnostic_report_can_call_configured_model() {
     );
     let recall = default_recall();
     let cases = load_answer_eval_cases(ANSWER_CASES_JSON).unwrap();
-    let observations = run_answer_diagnostics(&recall, &cases, |prompt| {
+    let observations = run_live_answer_diagnostics(&recall, &cases, io::stdout(), |prompt| {
         send_configured_prompt_with_audit(&config, "answer diagnostic", prompt, false, None)
             .map(|response| Some(response.answer))
     })
