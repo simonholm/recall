@@ -17,14 +17,15 @@
       ]
     },
     {
-      "id": "git-adapter-implementation",
-      "question": "When did I implement the Git adapter?",
+      "id": "clean-slate-initial-implementation",
+      "question": "What was the Initial Recall implementation?",
+      "as_of": "2026-08-26T17:12:00Z",
       "expected_facts": [
         {
-          "name": "Git adapter maps commit history",
+          "name": "The clean-slate root is the Initial Recall implementation",
           "phrases": [
-            "git adapter",
-            "commit history"
+            "Initial Recall implementation",
+            "a5c93c7"
           ]
         }
       ]
