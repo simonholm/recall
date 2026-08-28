@@ -933,6 +933,11 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn default_model_literal_requires_intentional_test_update() {
+        assert_eq!(DEFAULT_MODEL, "deepseek/deepseek-v4-flash-0731");
+    }
+
+    #[test]
     fn config_loads_defaults_without_api_key() {
         let config = OpenRouterConfig::from_lookup(|_| None);
 
@@ -1000,6 +1005,31 @@ mod tests {
 
         assert_eq!(config.api_key.as_deref(), Some("file-key"));
         assert!(config.is_configured());
+    }
+
+    #[test]
+    fn config_ignores_model_like_fields_in_stored_auth_json() {
+        let home = temp_home("stored-model-fields");
+        write_auth_json(
+            &home,
+            r#"{
+  "openrouter_api_key": "file-key",
+  "openrouter_model": "stored/openrouter-model",
+  "model": "stored/model"
+}
+"#,
+        );
+
+        let default_config = OpenRouterConfig::from_lookup_and_home(|_| None, Some(&home));
+        let override_config = OpenRouterConfig::from_lookup_and_home(
+            |key| (key == "RECALL_OPENROUTER_MODEL").then(|| "env/model".to_string()),
+            Some(&home),
+        );
+
+        assert_eq!(default_config.api_key.as_deref(), Some("file-key"));
+        assert_eq!(default_config.model, DEFAULT_MODEL);
+        assert_eq!(override_config.api_key.as_deref(), Some("file-key"));
+        assert_eq!(override_config.model, "env/model");
     }
 
     #[test]
@@ -1103,6 +1133,15 @@ mod tests {
 
         let path = save_api_key(&home, " stored-key ").unwrap();
 
+        let record = serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+        let object = record.as_object().unwrap();
+        assert_eq!(object.len(), 1);
+        assert_eq!(
+            object.get("openrouter_api_key").and_then(Value::as_str),
+            Some("stored-key")
+        );
+        assert!(!object.contains_key("openrouter_model"));
+        assert!(!object.contains_key("model"));
         assert_eq!(path, auth_path(&home));
         assert_eq!(
             load_auth_record(&path).unwrap().as_deref(),
