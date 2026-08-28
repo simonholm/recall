@@ -601,12 +601,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "recall-claude"
+version = "0.1.0"
+dependencies = [
+ "recall-core",
+ "serde_json",
+]
+
+[[package]]
 name = "recall-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
  "form_urlencoded",
+ "recall-claude",
  "recall-codex",
  "recall-core",
  "recall-git",

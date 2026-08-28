@@ -11,6 +11,7 @@ mod outbound_audit;
 use clap::{Parser, Subcommand};
 use openrouter::{AuthStatus, LlmDiagnostics, OpenRouterConfig};
 use outbound_audit::OutboundAuditConfig;
+use recall_claude::ClaudeAdapter;
 use recall_codex::CodexAdapter;
 use recall_core::{
     ContextCompiler, DateRange, Event, EventId, EventRef, EvidenceBlock, PromptBuilder, Recall,
@@ -101,6 +102,7 @@ fn main() -> ExitCode {
 fn default_recall() -> Recall {
     let mut recall = Recall::new();
     recall.register(CodexAdapter::new());
+    recall.register(ClaudeAdapter::new());
     recall.register(GitAdapter::new());
     recall
 }
@@ -1047,7 +1049,7 @@ mod tests {
     fn default_registry_registers_current_adapters() {
         let recall = default_recall();
 
-        assert_eq!(recall.adapter_count(), 2);
+        assert_eq!(recall.adapter_count(), 3);
     }
 
     #[test]

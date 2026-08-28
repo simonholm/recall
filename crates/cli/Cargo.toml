@@ -9,6 +9,7 @@ rust-version.workspace = true
 chrono.workspace = true
 clap.workspace = true
 form_urlencoded.workspace = true
+recall-claude.workspace = true
 recall-codex.workspace = true
 recall-core.workspace = true
 recall-git.workspace = true
