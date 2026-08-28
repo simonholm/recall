@@ -606,6 +606,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "form_urlencoded",
  "recall-codex",
  "recall-core",
  "recall-git",

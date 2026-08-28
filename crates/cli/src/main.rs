@@ -20,6 +20,7 @@ use recall_git::GitAdapter;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, BufRead, Write as IoWrite};
+use std::path::Path;
 use std::process::ExitCode;
 
 const ASK_RESULT_LIMIT: usize = 8;
@@ -55,6 +56,9 @@ enum Command {
         /// Print the final prompt sent to OpenRouter before requesting an answer.
         #[arg(long)]
         debug_prompt: bool,
+        /// Print a Codex Desktop deep link for the compiled prompt instead of calling OpenRouter.
+        #[arg(long)]
+        codex: bool,
         /// Natural-language question to ask.
         question: Vec<String>,
     },
@@ -113,6 +117,7 @@ fn run(cli: Cli, recall: &Recall) -> Result<(), String> {
             debug_query,
             debug_search,
             debug_prompt,
+            codex,
             question,
         } => {
             if question.is_empty() {
@@ -132,6 +137,8 @@ fn run(cli: Cli, recall: &Recall) -> Result<(), String> {
                         search: debug_search,
                         prompt: debug_prompt,
                     },
+                    codex,
+                    None,
                 )?
             );
         }
@@ -289,6 +296,8 @@ fn ask_output(
     openrouter_config: &OpenRouterConfig,
     include_diagnostics: bool,
     debug_options: DebugOptions,
+    codex: bool,
+    codex_workspace_path: Option<&Path>,
 ) -> Result<String, String> {
     ask_output_with_audit(
         recall,
@@ -297,6 +306,8 @@ fn ask_output(
         include_diagnostics,
         debug_options,
         OutboundAuditConfig::from_env(),
+        codex,
+        codex_workspace_path,
     )
 }
 
@@ -307,6 +318,8 @@ fn ask_output_with_audit(
     include_diagnostics: bool,
     debug_options: DebugOptions,
     audit_config: Option<OutboundAuditConfig>,
+    codex: bool,
+    codex_workspace_path: Option<&Path>,
 ) -> Result<String, String> {
     let plan = RetrievalPlanner::new().plan(question);
     let retrieval = ask_retrieval(recall, &plan)?;
@@ -325,6 +338,11 @@ fn ask_output_with_audit(
             &prompt
         )
     );
+
+    if codex {
+        let link = codex_new_thread_deep_link(codex_workspace_path, &prompt);
+        return Ok(format_codex_deep_link_output(&link));
+    }
 
     if let Some(error) = openrouter_config.credential_error() {
         return Err(error.to_string());
@@ -351,6 +369,20 @@ fn ask_output_with_audit(
     }
 
     Ok(format!("{configuration}\n{answer_output}"))
+}
+
+fn codex_new_thread_deep_link(workspace_path: Option<&Path>, prompt: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    if let Some(path) = workspace_path {
+        serializer.append_pair("path", &path.display().to_string());
+    }
+    serializer.append_pair("prompt", prompt);
+    let query = serializer.finish();
+    format!("codex://threads/new?{query}")
+}
+
+fn format_codex_deep_link_output(link: &str) -> String {
+    format!("Codex deep link:\n{link}\n")
 }
 
 fn send_configured_prompt_with_audit(
@@ -930,6 +962,7 @@ mod tests {
             debug_query,
             debug_search,
             debug_prompt,
+            codex,
             ..
         } = cli.command
         else {
@@ -938,6 +971,7 @@ mod tests {
         assert!(!debug_query);
         assert!(!debug_search);
         assert!(!debug_prompt);
+        assert!(!codex);
     }
 
     #[test]
@@ -956,6 +990,7 @@ mod tests {
             debug_query,
             debug_search,
             debug_prompt,
+            codex,
             ..
         } = cli.command
         else {
@@ -964,6 +999,17 @@ mod tests {
         assert!(debug_query);
         assert!(debug_search);
         assert!(debug_prompt);
+        assert!(!codex);
+    }
+
+    #[test]
+    fn ask_codex_flag_is_accepted() {
+        let cli = Cli::try_parse_from(["recall", "ask", "What happened?", "--codex"]).unwrap();
+
+        let Command::Ask { codex, .. } = cli.command else {
+            panic!("expected ask command");
+        };
+        assert!(codex);
     }
 
     #[test]
@@ -1242,6 +1288,8 @@ mod tests {
             &OpenRouterConfig::without_api_key_for_tests(),
             false,
             DebugOptions::default(),
+            false,
+            None,
         )
         .unwrap();
         let events = ask_events(&recall, "ask").unwrap();
@@ -1254,6 +1302,81 @@ mod tests {
                 "Configuration:\n  Model: deepseek/deepseek-v4-flash-0731\n  API key: no\n\nSearch query:\nask\n\n{prompt}"
             )
         );
+    }
+
+    #[test]
+    fn codex_new_thread_deep_link_encodes_path_and_prompt() {
+        let link = codex_new_thread_deep_link(
+            Some(Path::new("/tmp/recall workspace/#1")),
+            "Line one\nLine two & three+four",
+        );
+
+        assert_eq!(
+            link,
+            "codex://threads/new?path=%2Ftmp%2Frecall+workspace%2F%231&prompt=Line+one%0ALine+two+%26+three%2Bfour"
+        );
+        assert_eq!(
+            decoded_deep_link_query(&link),
+            vec![
+                ("path".to_string(), "/tmp/recall workspace/#1".to_string()),
+                (
+                    "prompt".to_string(),
+                    "Line one\nLine two & three+four".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_new_thread_deep_link_can_omit_path() {
+        let link = codex_new_thread_deep_link(None, "Question only");
+
+        assert_eq!(link, "codex://threads/new?prompt=Question+only");
+        assert_eq!(
+            decoded_deep_link_query(&link),
+            vec![("prompt".to_string(), "Question only".to_string())]
+        );
+    }
+
+    #[test]
+    fn codex_ask_output_uses_compiled_prompt_without_openrouter_configuration() {
+        let mut recall = Recall::new();
+        let mut event = Event::new(
+            "event-1",
+            Source::Other("test".to_string()),
+            "ask milestone",
+        );
+        event.description = "Detailed event body".to_string();
+        recall.register(TestAdapter::new(vec![event]));
+
+        let output = ask_output(
+            &recall,
+            "When did I ask?",
+            &OpenRouterConfig::without_api_key_for_tests(),
+            false,
+            DebugOptions::default(),
+            true,
+            None,
+        )
+        .unwrap();
+        let link = output
+            .strip_prefix("Codex deep link:\n")
+            .and_then(|output| output.strip_suffix('\n'))
+            .expect("output should contain only a usable deep link");
+        let query = decoded_deep_link_query(link);
+        let prompt = query
+            .iter()
+            .find_map(|(key, value)| (key == "prompt").then_some(value))
+            .expect("prompt query parameter");
+        let plan = RetrievalPlanner::new().plan("When did I ask?");
+        let retrieval = ask_retrieval(&recall, &plan).unwrap();
+        let evidence = compile_evidence(&plan, "When did I ask?", &retrieval.events);
+        let expected_prompt = PromptBuilder::new().build("When did I ask?", &evidence);
+
+        assert!(!query.iter().any(|(key, _)| key == "path"));
+        assert_eq!(prompt, &expected_prompt);
+        assert!(!output.contains("Configuration:"));
+        assert!(!output.contains("API key"));
     }
 
     #[test]
@@ -1305,6 +1428,8 @@ mod tests {
             false,
             DebugOptions::default(),
             Some(audit_config),
+            false,
+            None,
         )
         .unwrap();
 
@@ -1604,5 +1729,14 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("recall-cli-audit-{name}-{unique}"))
+    }
+
+    fn decoded_deep_link_query(link: &str) -> Vec<(String, String)> {
+        let query = link
+            .strip_prefix("codex://threads/new?")
+            .expect("new Codex thread deep link");
+        form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect()
     }
 }
