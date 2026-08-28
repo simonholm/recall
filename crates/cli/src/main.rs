@@ -14,8 +14,9 @@ use outbound_audit::OutboundAuditConfig;
 use recall_claude::ClaudeAdapter;
 use recall_codex::CodexAdapter;
 use recall_core::{
-    ContextCompiler, DateRange, Event, EventId, EventRef, EvidenceBlock, PromptBuilder, Recall,
-    RetrievalPlan, RetrievalPlanner, SearchResult, Source, Timeline,
+    AdapterCallTiming, ContextCompiler, DateRange, Event, EventId, EventRef, EvidenceBlock,
+    PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch,
+    SearchResult, Source, Timeline, TimelineDiagnostics,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -23,6 +24,7 @@ use std::fs::File;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Instant;
 
 const ASK_RESULT_LIMIT: usize = 8;
 
@@ -292,6 +294,51 @@ struct DebugOptions {
     prompt: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AskTimings {
+    retrieval_planning_ms: u64,
+    retrieval: Option<RetrievalTimings>,
+    context_compilation_ms: u64,
+    prompt_construction_ms: u64,
+    openrouter_request_start_ms: Option<u64>,
+    total_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RetrievalTimings {
+    planning_ms: u64,
+    search: Option<SearchRetrievalTimings>,
+    timeline: Option<TimelineRetrievalTimings>,
+    inspect_total_ms: u64,
+    inspections: Vec<InspectTiming>,
+    total_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchRetrievalTimings {
+    adapter_searches: Vec<AdapterCallTiming>,
+    sort_ms: u64,
+    total_ms: u64,
+    limit_ms: u64,
+    returned_results: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TimelineRetrievalTimings {
+    adapter_timelines: Vec<AdapterCallTiming>,
+    sort_ms: u64,
+    total_ms: u64,
+    filter_limit_ms: u64,
+    returned_events: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InspectTiming {
+    event_ref: EventRef,
+    elapsed_ms: u64,
+    found: bool,
+}
+
 fn ask_output(
     recall: &Recall,
     question: &str,
@@ -323,10 +370,30 @@ fn ask_output_with_audit(
     codex: bool,
     codex_workspace_path: Option<&Path>,
 ) -> Result<String, String> {
+    let ask_started = Instant::now();
+    let mut timings = AskTimings::default();
+
+    let retrieval_started = Instant::now();
     let plan = RetrievalPlanner::new().plan(question);
-    let retrieval = ask_retrieval(recall, &plan)?;
+    let planning_ms = elapsed_ms(retrieval_started);
+    let (retrieval, retrieval_timings) = if include_diagnostics {
+        let retrieval = ask_retrieval_with_timings(recall, &plan, planning_ms)?;
+        let timings = retrieval.timings.clone();
+        (retrieval.into_retrieval(), Some(timings))
+    } else {
+        (ask_retrieval(recall, &plan)?, None)
+    };
+    timings.retrieval_planning_ms = elapsed_ms(retrieval_started);
+    timings.retrieval = retrieval_timings;
+
+    let compilation_started = Instant::now();
     let evidence = compile_evidence(&plan, question, &retrieval.events);
+    timings.context_compilation_ms = elapsed_ms(compilation_started);
+
+    let prompt_started = Instant::now();
     let prompt = PromptBuilder::new().build(question, &evidence);
+    timings.prompt_construction_ms = elapsed_ms(prompt_started);
+
     let configuration = format_configuration_output(openrouter_config);
 
     eprint!(
@@ -350,13 +417,19 @@ fn ask_output_with_audit(
         return Err(error.to_string());
     }
 
+    timings.total_ms = elapsed_ms(ask_started);
     if !openrouter_config.is_configured() {
-        return Ok(format!(
+        let mut output = format!(
             "{configuration}\n{}",
             format_prompt_only_output(&format_retrieval_plan(&plan), &prompt)
-        ));
+        );
+        if include_diagnostics {
+            append_ask_timings_output(&mut output, &timings);
+        }
+        return Ok(output);
     }
 
+    timings.openrouter_request_start_ms = Some(elapsed_ms(ask_started));
     let answer = send_configured_prompt_with_audit(
         openrouter_config,
         question,
@@ -364,10 +437,12 @@ fn ask_output_with_audit(
         include_diagnostics,
         audit_config,
     )?;
+    timings.total_ms = elapsed_ms(ask_started);
     let mut answer_output =
         format_answer_output(&format_retrieval_plan(&plan), &evidence, &answer.answer);
     if include_diagnostics {
         append_diagnostics_output(&mut answer_output, answer.diagnostics.as_ref());
+        append_ask_timings_output(&mut answer_output, &timings);
     }
 
     Ok(format!("{configuration}\n{answer_output}"))
@@ -671,9 +746,110 @@ fn append_diagnostics_output(output: &mut String, diagnostics: Option<&LlmDiagno
     }
 }
 
-fn ask_search_results(recall: &Recall, search_query: &str) -> Result<Vec<SearchResult>, String> {
+fn append_ask_timings_output(output: &mut String, timings: &AskTimings) {
+    writeln!(output).unwrap();
+    writeln!(output, "Ask timings:").unwrap();
+    writeln!(
+        output,
+        "  Retrieval/planning: {} ms",
+        timings.retrieval_planning_ms
+    )
+    .unwrap();
+    if let Some(retrieval) = &timings.retrieval {
+        writeln!(output, "  Retrieval/planning detail:").unwrap();
+        writeln!(output, "    Planning: {} ms", retrieval.planning_ms).unwrap();
+        if let Some(search) = &retrieval.search {
+            writeln!(output, "    Search total: {} ms", search.total_ms).unwrap();
+            for adapter in &search.adapter_searches {
+                writeln!(
+                    output,
+                    "    Search adapter {}: {} ms ({} results)",
+                    adapter.source.as_str(),
+                    adapter.elapsed_ms,
+                    adapter.item_count
+                )
+                .unwrap();
+            }
+            writeln!(output, "    Search sort: {} ms", search.sort_ms).unwrap();
+            writeln!(
+                output,
+                "    Search result limit: {} ms ({} retained)",
+                search.limit_ms, search.returned_results
+            )
+            .unwrap();
+        }
+        if let Some(timeline) = &retrieval.timeline {
+            writeln!(output, "    Timeline total: {} ms", timeline.total_ms).unwrap();
+            for adapter in &timeline.adapter_timelines {
+                writeln!(
+                    output,
+                    "    Timeline adapter {}: {} ms ({} events)",
+                    adapter.source.as_str(),
+                    adapter.elapsed_ms,
+                    adapter.item_count
+                )
+                .unwrap();
+            }
+            writeln!(output, "    Timeline sort: {} ms", timeline.sort_ms).unwrap();
+            writeln!(
+                output,
+                "    Timeline filter/limit: {} ms ({} retained)",
+                timeline.filter_limit_ms, timeline.returned_events
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "    Inspect total: {} ms ({} events)",
+            retrieval.inspect_total_ms,
+            retrieval.inspections.len()
+        )
+        .unwrap();
+        for inspection in &retrieval.inspections {
+            let status = if inspection.found { "found" } else { "missing" };
+            writeln!(
+                output,
+                "    Inspect {}: {} ms ({status})",
+                format_event_ref(&inspection.event_ref),
+                inspection.elapsed_ms
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "    Retrieval function total: {} ms",
+            retrieval.total_ms
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "  Context compilation: {} ms",
+        timings.context_compilation_ms
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Prompt construction: {} ms",
+        timings.prompt_construction_ms
+    )
+    .unwrap();
+    match timings.openrouter_request_start_ms {
+        Some(openrouter_request_start_ms) => {
+            writeln!(
+                output,
+                "  OpenRouter request start: {openrouter_request_start_ms} ms"
+            )
+            .unwrap();
+        }
+        None => writeln!(output, "  OpenRouter request start: none").unwrap(),
+    }
+    writeln!(output, "  Total ask: {} ms", timings.total_ms).unwrap();
+}
+
+fn ask_search_matches(recall: &Recall, search_query: &str) -> Result<Vec<SearchMatch>, String> {
     Ok(recall
-        .search(search_query)
+        .search_events(search_query)
         .map_err(|error| error.to_string())?
         .into_iter()
         .take(ASK_RESULT_LIMIT)
@@ -685,11 +861,26 @@ struct AskRetrieval {
     search_results: Vec<SearchResult>,
 }
 
+struct AskRetrievalWithTimings {
+    events: Vec<Event>,
+    search_results: Vec<SearchResult>,
+    timings: RetrievalTimings,
+}
+
+impl AskRetrievalWithTimings {
+    fn into_retrieval(self) -> AskRetrieval {
+        AskRetrieval {
+            events: self.events,
+            search_results: self.search_results,
+        }
+    }
+}
+
 fn ask_retrieval(recall: &Recall, plan: &RetrievalPlan) -> Result<AskRetrieval, String> {
     match plan {
         RetrievalPlan::Search { query } => {
-            let search_results = ask_search_results(recall, query)?;
-            let events = inspect_search_results(recall, &search_results)?;
+            let search_matches = ask_search_matches(recall, query)?;
+            let (search_results, events) = split_search_matches(search_matches);
             Ok(AskRetrieval {
                 events,
                 search_results,
@@ -700,6 +891,110 @@ fn ask_retrieval(recall: &Recall, plan: &RetrievalPlan) -> Result<AskRetrieval, 
             search_results: Vec::new(),
         }),
     }
+}
+
+fn ask_retrieval_with_timings(
+    recall: &Recall,
+    plan: &RetrievalPlan,
+    planning_ms: u64,
+) -> Result<AskRetrievalWithTimings, String> {
+    let total_started = Instant::now();
+    match plan {
+        RetrievalPlan::Search { query } => {
+            let search = recall
+                .search_with_diagnostics(query)
+                .map_err(|error| error.to_string())?;
+            let SearchDiagnostics {
+                adapter_searches,
+                sort_ms,
+                total_ms: search_total_ms,
+            } = search.diagnostics;
+
+            let limit_started = Instant::now();
+            let search_matches: Vec<_> =
+                search.results.into_iter().take(ASK_RESULT_LIMIT).collect();
+            let limit_ms = elapsed_ms(limit_started);
+
+            let returned_results = search_matches.len();
+            let (search_results, events) = split_search_matches(search_matches);
+            let inspect_total_ms = 0;
+            let total_ms = elapsed_ms(total_started);
+
+            Ok(AskRetrievalWithTimings {
+                events,
+                search_results,
+                timings: RetrievalTimings {
+                    planning_ms,
+                    search: Some(SearchRetrievalTimings {
+                        adapter_searches,
+                        sort_ms,
+                        total_ms: search_total_ms,
+                        limit_ms,
+                        returned_results,
+                    }),
+                    timeline: None,
+                    inspect_total_ms,
+                    inspections: Vec::new(),
+                    total_ms,
+                },
+            })
+        }
+        RetrievalPlan::Timeline { range } => {
+            let timeline = recall
+                .timeline_with_diagnostics()
+                .map_err(|error| error.to_string())?;
+            let TimelineDiagnostics {
+                adapter_timelines,
+                sort_ms,
+                total_ms,
+            } = timeline.diagnostics;
+
+            let filter_started = Instant::now();
+            let events: Vec<_> = timeline
+                .timeline
+                .events
+                .into_iter()
+                .filter(|event| {
+                    event
+                        .timestamp
+                        .as_ref()
+                        .is_some_and(|timestamp| range.contains_timestamp(timestamp))
+                })
+                .collect();
+            let events = match range {
+                DateRange::Day(_) => events,
+                _ => events.into_iter().take(ASK_RESULT_LIMIT).collect(),
+            };
+            let filter_limit_ms = elapsed_ms(filter_started);
+            let returned_events = events.len();
+
+            Ok(AskRetrievalWithTimings {
+                events,
+                search_results: Vec::new(),
+                timings: RetrievalTimings {
+                    planning_ms,
+                    search: None,
+                    timeline: Some(TimelineRetrievalTimings {
+                        adapter_timelines,
+                        sort_ms,
+                        total_ms,
+                        filter_limit_ms,
+                        returned_events,
+                    }),
+                    inspect_total_ms: 0,
+                    inspections: Vec::new(),
+                    total_ms: elapsed_ms(total_started),
+                },
+            })
+        }
+    }
+}
+
+fn split_search_matches(search_matches: Vec<SearchMatch>) -> (Vec<SearchResult>, Vec<Event>) {
+    search_matches
+        .into_iter()
+        .map(|search_match| (search_match.result, search_match.event))
+        .unzip()
 }
 
 fn compile_evidence(plan: &RetrievalPlan, question: &str, events: &[Event]) -> Vec<EvidenceBlock> {
@@ -755,16 +1050,6 @@ fn format_date_range(range: &DateRange) -> String {
     }
 }
 
-fn inspect_search_results(
-    recall: &Recall,
-    search_results: &[SearchResult],
-) -> Result<Vec<Event>, String> {
-    search_results
-        .iter()
-        .map(|result| inspect_result_event(recall, &result.event))
-        .collect()
-}
-
 #[cfg(test)]
 fn ask_events(recall: &Recall, search_query: &str) -> Result<Vec<Event>, String> {
     recall
@@ -776,6 +1061,7 @@ fn ask_events(recall: &Recall, search_query: &str) -> Result<Vec<Event>, String>
         .collect()
 }
 
+#[cfg(test)]
 fn inspect_result_event(recall: &Recall, event_ref: &EventRef) -> Result<Event, String> {
     recall
         .inspect(event_ref)
@@ -785,6 +1071,10 @@ fn inspect_result_event(recall: &Recall, event_ref: &EventRef) -> Result<Event, 
 
 fn format_event_ref(event_ref: &EventRef) -> String {
     format!("{}:{}", event_ref.source.as_str(), event_ref.id.as_str())
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn parse_event_ref(value: &str) -> Result<EventRef, String> {
@@ -948,6 +1238,45 @@ mod tests {
 
         fn inspect(&self, id: &EventId) -> AdapterResult<Option<Event>> {
             Ok(self.events.iter().find(|event| event.id == *id).cloned())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SearchEventsOnlyAdapter {
+        event: Event,
+    }
+
+    impl Adapter for SearchEventsOnlyAdapter {
+        fn source(&self) -> Source {
+            Source::Other("test".to_string())
+        }
+
+        fn search(&self, _query: &str) -> AdapterResult<Vec<SearchResult>> {
+            Ok(Vec::new())
+        }
+
+        fn search_events(&self, _query: &str) -> AdapterResult<Vec<SearchMatch>> {
+            Ok(vec![SearchMatch {
+                result: SearchResult {
+                    event: EventRef::new(self.event.source.clone(), self.event.id.clone()),
+                    score: Some(1),
+                    snippet: self.event.title.clone(),
+                    metadata: Metadata::new(),
+                    diagnostics: Metadata::new(),
+                },
+                event: self.event.clone(),
+            }])
+        }
+
+        fn timeline(&self) -> AdapterResult<Timeline> {
+            Ok(Timeline { events: Vec::new() })
+        }
+
+        fn inspect(&self, _id: &EventId) -> AdapterResult<Option<Event>> {
+            Err(recall_core::AdapterError::new(
+                Source::Other("test".to_string()),
+                "inspect should not be called",
+            ))
         }
     }
 
@@ -1307,6 +1636,32 @@ mod tests {
     }
 
     #[test]
+    fn ask_output_uses_search_events_without_reinspecting_results() {
+        let mut recall = Recall::new();
+        let mut event = Event::new(
+            "event-1",
+            Source::Other("test".to_string()),
+            "ask milestone",
+        );
+        event.description = "Implemented search_events reuse.".to_string();
+        recall.register(SearchEventsOnlyAdapter { event });
+
+        let output = ask_output(
+            &recall,
+            "When did I ask?",
+            &OpenRouterConfig::without_api_key_for_tests(),
+            false,
+            DebugOptions::default(),
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(output.contains("Implemented search_events reuse."));
+        assert!(!output.contains("inspect should not be called"));
+    }
+
+    #[test]
     fn codex_new_thread_deep_link_encodes_path_and_prompt() {
         let link = codex_new_thread_deep_link(
             Some(Path::new("/tmp/recall workspace/#1")),
@@ -1573,6 +1928,47 @@ mod tests {
         assert_eq!(
             output,
             "Answer:\nDone\n\nDiagnostics:\n  Model: openai/gpt-4o-mini\n  Provider: OpenAI\n  Prompt tokens: 100\n  Completion tokens: 20\n  Cached prompt tokens: 80\n  Reasoning tokens: 5\n  Total tokens: 120\n  Latency: 345 ms\n  Request creation: 1 ms\n  Upload to response headers: 2 ms\n  First body byte: 3 ms\n  Body completion: 4 ms\n  Total request: 5 ms\n  Response body bytes: 6\n  Cost: 0.0012\n"
+        );
+    }
+
+    #[test]
+    fn append_ask_timings_output_prints_available_fields_in_stable_order() {
+        let timings = AskTimings {
+            retrieval_planning_ms: 10,
+            retrieval: Some(RetrievalTimings {
+                planning_ms: 1,
+                search: Some(SearchRetrievalTimings {
+                    adapter_searches: vec![AdapterCallTiming {
+                        source: Source::Codex,
+                        elapsed_ms: 2,
+                        item_count: 3,
+                    }],
+                    sort_ms: 4,
+                    total_ms: 5,
+                    limit_ms: 6,
+                    returned_results: 7,
+                }),
+                timeline: None,
+                inspect_total_ms: 8,
+                inspections: vec![InspectTiming {
+                    event_ref: EventRef::new(Source::Codex, "event-1"),
+                    elapsed_ms: 9,
+                    found: true,
+                }],
+                total_ms: 10,
+            }),
+            context_compilation_ms: 20,
+            prompt_construction_ms: 30,
+            openrouter_request_start_ms: Some(40),
+            total_ms: 50,
+        };
+        let mut output = "Answer:\nDone\n".to_string();
+
+        append_ask_timings_output(&mut output, &timings);
+
+        assert_eq!(
+            output,
+            "Answer:\nDone\n\nAsk timings:\n  Retrieval/planning: 10 ms\n  Retrieval/planning detail:\n    Planning: 1 ms\n    Search total: 5 ms\n    Search adapter codex: 2 ms (3 results)\n    Search sort: 4 ms\n    Search result limit: 6 ms (7 retained)\n    Inspect total: 8 ms (1 events)\n    Inspect codex:event-1: 9 ms (found)\n    Retrieval function total: 10 ms\n  Context compilation: 20 ms\n  Prompt construction: 30 ms\n  OpenRouter request start: 40 ms\n  Total ask: 50 ms\n"
         );
     }
 

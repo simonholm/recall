@@ -10,8 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use recall_core::{
-    Adapter, AdapterError, AdapterResult, Event, EventId, EventRef, Metadata, SearchResult, Source,
-    Timeline, Timestamp,
+    Adapter, AdapterError, AdapterResult, Event, EventId, EventRef, Metadata, SearchMatch,
+    SearchResult, Source, Timeline, Timestamp,
 };
 use serde_json::Value;
 
@@ -138,6 +138,35 @@ impl Adapter for CodexAdapter {
                 .unwrap_or(0)
                 .cmp(&left.score.unwrap_or(0))
                 .then_with(|| left.event.id.cmp(&right.event.id))
+        });
+
+        Ok(results)
+    }
+
+    fn search_events(&self, query: &str) -> AdapterResult<Vec<SearchMatch>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_lower = query.to_lowercase();
+        let terms: Vec<_> = query_lower.split_whitespace().collect();
+
+        let mut results: Vec<_> = self
+            .scan()?
+            .into_iter()
+            .filter_map(|event| {
+                search_event(event.clone(), &query_lower, &terms)
+                    .map(|result| SearchMatch { result, event })
+            })
+            .collect();
+        results.sort_by(|left, right| {
+            right
+                .result
+                .score
+                .unwrap_or(0)
+                .cmp(&left.result.score.unwrap_or(0))
+                .then_with(|| left.result.event.id.cmp(&right.result.event.id))
         });
 
         Ok(results)

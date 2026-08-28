@@ -9,6 +9,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 /// Source-neutral metadata attached to events and search results.
 ///
@@ -317,6 +318,13 @@ pub struct SearchResult {
     /// participate in ranking or retrieval decisions.
     #[doc(hidden)]
     pub diagnostics: Metadata,
+}
+
+/// Request-local search match that keeps the materialized event with its result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchMatch {
+    pub result: SearchResult,
+    pub event: Event,
 }
 
 /// LLM-facing context compiled from a source event.
@@ -1739,6 +1747,28 @@ pub trait Adapter {
     /// make search output non-empty.
     fn search(&self, query: &str) -> AdapterResult<Vec<SearchResult>>;
 
+    /// Searches this source and returns each retained result with its event.
+    ///
+    /// The default preserves the existing search-then-inspect behavior.
+    fn search_events(&self, query: &str) -> AdapterResult<Vec<SearchMatch>> {
+        self.search(query)?
+            .into_iter()
+            .map(|result| {
+                let event = self.inspect(&result.event.id)?.ok_or_else(|| {
+                    AdapterError::new(
+                        result.event.source.clone(),
+                        format!(
+                            "event not found: {}:{}",
+                            result.event.source.as_str(),
+                            result.event.id.as_str()
+                        ),
+                    )
+                })?;
+                Ok(SearchMatch { result, event })
+            })
+            .collect()
+    }
+
     /// Returns a source-local timeline.
     ///
     /// Empty timelines are valid for placeholders and unavailable sources.
@@ -1759,6 +1789,39 @@ pub trait Adapter {
 #[derive(Default)]
 pub struct Recall {
     adapters: Vec<Box<dyn Adapter>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterCallTiming {
+    pub source: Source,
+    pub elapsed_ms: u64,
+    pub item_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchDiagnostics {
+    pub adapter_searches: Vec<AdapterCallTiming>,
+    pub sort_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchWithDiagnostics {
+    pub results: Vec<SearchMatch>,
+    pub diagnostics: SearchDiagnostics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelineDiagnostics {
+    pub adapter_timelines: Vec<AdapterCallTiming>,
+    pub sort_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelineWithDiagnostics {
+    pub timeline: Timeline,
+    pub diagnostics: TimelineDiagnostics,
 }
 
 impl Recall {
@@ -1791,17 +1854,59 @@ impl Recall {
                 Ok(results)
             })?;
 
-        results.sort_by(|left: &SearchResult, right: &SearchResult| {
-            right
-                .score
-                .unwrap_or(0)
-                .cmp(&left.score.unwrap_or(0))
-                .then_with(|| left.event.source.cmp(&right.event.source))
-                .then_with(|| left.event.id.cmp(&right.event.id))
-                .then_with(|| left.snippet.cmp(&right.snippet))
-        });
+        sort_search_results(&mut results);
 
         Ok(results)
+    }
+
+    /// Searches all registered adapters and keeps each result's event.
+    pub fn search_events(&self, query: &str) -> AdapterResult<Vec<SearchMatch>> {
+        let mut results = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.search_events(query))
+            .try_fold(Vec::new(), |mut results, adapter_results| {
+                results.extend(adapter_results?);
+                Ok(results)
+            })?;
+
+        sort_search_matches(&mut results);
+
+        Ok(results)
+    }
+
+    /// Searches all registered adapters and records opt-in diagnostic timings.
+    pub fn search_with_diagnostics(&self, query: &str) -> AdapterResult<SearchWithDiagnostics> {
+        let total_started = Instant::now();
+        let mut results = Vec::new();
+        let mut adapter_searches = Vec::new();
+        for adapter in &self.adapters {
+            let source = adapter.source();
+            let search_started = Instant::now();
+            let adapter_results = adapter.search_events(query)?;
+            let elapsed_ms = elapsed_ms(search_started);
+            let item_count = adapter_results.len();
+            results.extend(adapter_results);
+            adapter_searches.push(AdapterCallTiming {
+                source,
+                elapsed_ms,
+                item_count,
+            });
+        }
+
+        let sort_started = Instant::now();
+        sort_search_matches(&mut results);
+        let sort_ms = elapsed_ms(sort_started);
+        let total_ms = elapsed_ms(total_started);
+
+        Ok(SearchWithDiagnostics {
+            results,
+            diagnostics: SearchDiagnostics {
+                adapter_searches,
+                sort_ms,
+                total_ms,
+            },
+        })
     }
 
     /// Returns a combined timeline from all registered adapters.
@@ -1815,16 +1920,43 @@ impl Recall {
                 Ok(events)
             })?;
 
-        events.sort_by(
-            |left: &Event, right: &Event| match (&left.timestamp, &right.timestamp) {
-                (Some(left), Some(right)) => right.cmp(left),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            },
-        );
+        sort_timeline_events(&mut events);
 
         Ok(Timeline { events })
+    }
+
+    /// Returns a combined timeline and records opt-in diagnostic timings.
+    pub fn timeline_with_diagnostics(&self) -> AdapterResult<TimelineWithDiagnostics> {
+        let total_started = Instant::now();
+        let mut events = Vec::new();
+        let mut adapter_timelines = Vec::new();
+        for adapter in &self.adapters {
+            let source = adapter.source();
+            let timeline_started = Instant::now();
+            let timeline = adapter.timeline()?;
+            let elapsed_ms = elapsed_ms(timeline_started);
+            let item_count = timeline.events.len();
+            events.extend(timeline.events);
+            adapter_timelines.push(AdapterCallTiming {
+                source,
+                elapsed_ms,
+                item_count,
+            });
+        }
+
+        let sort_started = Instant::now();
+        sort_timeline_events(&mut events);
+        let sort_ms = elapsed_ms(sort_started);
+        let total_ms = elapsed_ms(total_started);
+
+        Ok(TimelineWithDiagnostics {
+            timeline: Timeline { events },
+            diagnostics: TimelineDiagnostics {
+                adapter_timelines,
+                sort_ms,
+                total_ms,
+            },
+        })
     }
 
     /// Inspects a source-qualified event by routing to the owning adapter.
@@ -1837,6 +1969,39 @@ impl Recall {
 
         Ok(None)
     }
+}
+
+fn sort_search_matches(results: &mut [SearchMatch]) {
+    results.sort_by(|left, right| compare_search_results(&left.result, &right.result));
+}
+
+fn sort_search_results(results: &mut [SearchResult]) {
+    results.sort_by(compare_search_results);
+}
+
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    right
+        .score
+        .unwrap_or(0)
+        .cmp(&left.score.unwrap_or(0))
+        .then_with(|| left.event.source.cmp(&right.event.source))
+        .then_with(|| left.event.id.cmp(&right.event.id))
+        .then_with(|| left.snippet.cmp(&right.snippet))
+}
+
+fn sort_timeline_events(events: &mut [Event]) {
+    events.sort_by(
+        |left: &Event, right: &Event| match (&left.timestamp, &right.timestamp) {
+            (Some(left), Some(right)) => right.cmp(left),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+    );
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
