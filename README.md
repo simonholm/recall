@@ -14,16 +14,14 @@ may change between revisions as the design is tested and simplified.
 
 ## Current Status
 
-`recall ask` can retrieve and compile evidence from Git history and local Codex
-sessions, including explicit calendar-date and single-day timeline questions.
-Git evidence is preserved through compilation and reaches the generated prompt
-as direct evidence.
+`recall ask` can retrieve and compile evidence from Git history, local Codex
+sessions, and local Claude Code sessions, including explicit calendar-date and
+single-day timeline questions. Git evidence is preserved through compilation
+and reaches the generated prompt as direct evidence.
 
-The main area still under investigation is Codex evidence quality. Codex
-sessions are currently flattened early, which requires `ContextCompiler` to
-compensate with heuristics. Experiments with preserving more session structure
-have produced cleaner intermediate evidence, and this remains part of the
-project's ongoing evaluation rather than a settled design.
+Retrieval, evidence selection, context compilation, and answer behavior remain
+experimental. The project is still evaluating how much source structure to
+preserve and how to keep generated answers grounded in the selected evidence.
 
 ## Motivation
 
@@ -40,12 +38,13 @@ reasoning.
 - Timeline aggregation across registered adapters.
 - Git adapter for current-repository commit history.
 - Codex session adapter for local Codex JSONL session files.
+- Claude Code session adapter for local Claude Code JSONL session files.
 - Experimental `recall ask` command.
 - Retrieval planning and prompt generation from compiled evidence.
 - Explicit calendar-date planning for single-day timeline questions.
 - Optional OpenRouter model calls when `OPENROUTER_API_KEY` is configured.
 
-The default CLI currently registers the Git and Codex adapters.
+The default CLI currently registers the Codex, Claude Code, and Git adapters.
 
 ## Architecture
 
@@ -59,7 +58,7 @@ RetrievalPlanner
     ↓
 Search / Timeline
     ↓
-Inspect
+Retained events
     ↓
 ContextCompiler
     ↓
@@ -68,23 +67,19 @@ PromptBuilder
 Prompt or OpenRouter answer
 ```
 
-`RetrievalPlanner` classifies the question, `ContextCompiler` reduces retrieved
-events into focused evidence, and `PromptBuilder` formats that evidence for the
-answer request. OpenRouter transport is kept behind the CLI boundary and is
-used only when an API key is configured.
-
-A prompt-formatting experiment on 2026-08-24 tested compact evidence rendering
-against a representative real Recall prompt. Conservative grouping reduced the
-prompt by about 1.7%, and a more aggressive row-oriented format reduced the
-approximate token count by about 4.2%; evidence/project-state content dominated
-the size, so the compact format was rejected for now because the savings did not
-justify less readable, less self-contained evidence records. No TOON dependency
-or rendering change was adopted.
+`RetrievalPlanner` classifies the question, search-based `ask` keeps the full
+events already materialized with retained search results, `ContextCompiler`
+reduces retrieved events into focused evidence, and `PromptBuilder` formats
+that evidence for the answer request. OpenRouter transport is kept behind the
+CLI boundary and is used only when an API key is configured. Standalone
+`recall inspect <source>:<id>` still routes to the owning adapter and reads the
+requested event from its source.
 
 The workspace is split into focused crates:
 
 - `recall-core`: shared domain types and adapter interfaces.
 - `recall-codex`: adapter for local Codex session files.
+- `recall-claude`: adapter for local Claude Code session files.
 - `recall-git`: adapter for Git commit history.
 - `recall-cli`: command-line entry point.
 
@@ -129,12 +124,12 @@ recall ask "When did I implement timeline?"
 ```
 
 `recall ask` plans retrieval, searches or reads the timeline from supported
-sources, inspects matching events, compiles evidence, and builds a prompt. For
-explicit single-day questions, it keeps all matching events for that day before
-compilation. If `OPENROUTER_API_KEY` is set, it sends the prompt to OpenRouter
-with that key. Otherwise, Recall loads a stored OpenRouter key from
-`~/.local/share/recall/auth.json`. If neither credential exists, it prints the
-prompt instead of sending it.
+sources, reuses full events carried with retained search results, compiles
+evidence, and builds a prompt. For explicit single-day questions, it keeps all
+matching events for that day before compilation. If `OPENROUTER_API_KEY` is
+set, it sends the prompt to OpenRouter with that key. Otherwise, Recall loads a
+stored OpenRouter key from `~/.local/share/recall/auth.json`. If neither
+credential exists, it prints the prompt instead of sending it.
 
 Store an OpenRouter key once for future SSH sessions:
 
@@ -173,12 +168,14 @@ recall ask --diagnostics "What did I work on today?"
 ## Privacy
 
 Recall reads local development artifacts. The current adapters can read Git
-history from the current repository and Codex session files from the local Codex
-sessions directory.
+history from the current repository, Codex session files from the local Codex
+sessions directory, and Claude Code session files from the local Claude Code
+projects directory.
 
 Generated prompts and model requests may include metadata from local Codex
-sessions and Git history, such as source ids, timestamps, paths, commit text,
-and session content. Review generated prompts before sharing them publicly.
+sessions, local Claude Code sessions, and Git history, such as source ids,
+timestamps, paths, commit text, and session content. Review generated prompts
+before sharing them publicly.
 
 Outbound audit records written under `RECALL_OUTBOUND_LOG_DIR` contain exact
 model prompts and can include private engineering history. Treat that directory
