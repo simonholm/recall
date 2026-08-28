@@ -597,7 +597,7 @@ impl PromptBuilder {
         prompt.push_str("Use ONLY the supplied context.\n\n");
         prompt.push_str("If the context does not contain enough information,\n");
         prompt.push_str("say so.\n\n");
-        prompt.push_str("When evidence describes an evolving or contradictory state, distinguish intermediate findings from the latest known state. If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology.\n\n");
+        prompt.push_str("When evidence describes an evolving or contradictory state, distinguish intermediate findings from the latest known state. If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology. Describe superseded earlier conclusions as what appeared true, was believed, or was concluded at that point, not as objective final facts.\n\n");
         prompt.push_str("Cite source ids when referring to events.\n\n");
         prompt.push_str("Question:\n\n");
         prompt.push_str(question);
@@ -1992,16 +1992,16 @@ mod tests {
             source: Source::Codex,
             id: EventId::new("session-earlier"),
             timestamp: Some(Timestamp::new("2026-08-28T09:00:00Z")),
-            title: "Investigate OpenRouter API key".to_string(),
-            body: "Restarted Codex, but the OPENROUTER_API_KEY problem remained.".to_string(),
+            title: "Investigate build failure".to_string(),
+            body: "Initial diagnosis: the flaky build failure was permanently resolved."
+                .to_string(),
         };
         let later = EvidenceBlock {
             source: Source::Codex,
             id: EventId::new("session-later"),
             timestamp: Some(Timestamp::new("2026-08-28T11:30:00Z")),
-            title: "Resolve OpenRouter API key".to_string(),
-            body: "Established the final state: OPENROUTER_API_KEY was configured correctly."
-                .to_string(),
+            title: "Revisit build failure".to_string(),
+            body: "Later evidence showed the earlier diagnosis was incomplete.".to_string(),
         };
 
         let prompt = PromptBuilder::new().build("What did I do today?", &[later, earlier]);
@@ -2011,6 +2011,9 @@ mod tests {
         ));
         assert!(prompt.contains(
             "If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology."
+        ));
+        assert!(prompt.contains(
+            "Describe superseded earlier conclusions as what appeared true, was believed, or was concluded at that point, not as objective final facts."
         ));
         assert!(
             prompt.find("Id: session-later").unwrap() < prompt.find("Id: session-earlier").unwrap()
