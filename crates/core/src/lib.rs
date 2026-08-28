@@ -597,6 +597,7 @@ impl PromptBuilder {
         prompt.push_str("Use ONLY the supplied context.\n\n");
         prompt.push_str("If the context does not contain enough information,\n");
         prompt.push_str("say so.\n\n");
+        prompt.push_str("When evidence describes an evolving or contradictory state, distinguish intermediate findings from the latest known state. If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology.\n\n");
         prompt.push_str("Cite source ids when referring to events.\n\n");
         prompt.push_str("Question:\n\n");
         prompt.push_str(question);
@@ -1983,6 +1984,37 @@ mod tests {
         assert!(prompt.contains(
             "Interpret relative temporal expressions such as \"today\", \"yesterday\", \"this week\", and \"last week\" relative to this date."
         ));
+    }
+
+    #[test]
+    fn prompt_builder_instructs_latest_timeline_state_to_supersede_intermediate_findings() {
+        let earlier = EvidenceBlock {
+            source: Source::Codex,
+            id: EventId::new("session-earlier"),
+            timestamp: Some(Timestamp::new("2026-08-28T09:00:00Z")),
+            title: "Investigate OpenRouter API key".to_string(),
+            body: "Restarted Codex, but the OPENROUTER_API_KEY problem remained.".to_string(),
+        };
+        let later = EvidenceBlock {
+            source: Source::Codex,
+            id: EventId::new("session-later"),
+            timestamp: Some(Timestamp::new("2026-08-28T11:30:00Z")),
+            title: "Resolve OpenRouter API key".to_string(),
+            body: "Established the final state: OPENROUTER_API_KEY was configured correctly."
+                .to_string(),
+        };
+
+        let prompt = PromptBuilder::new().build("What did I do today?", &[later, earlier]);
+
+        assert!(prompt.contains(
+            "When evidence describes an evolving or contradictory state, distinguish intermediate findings from the latest known state."
+        ));
+        assert!(prompt.contains(
+            "If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology."
+        ));
+        assert!(
+            prompt.find("Id: session-later").unwrap() < prompt.find("Id: session-earlier").unwrap()
+        );
     }
 
     #[test]
