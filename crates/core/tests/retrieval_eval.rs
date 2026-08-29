@@ -44,6 +44,9 @@ const ASK_STOP_WORDS: &[&str] = &[
     "today",
     "todays",
     "work",
+    "leave",
+    "off",
+    "with",
 ];
 const ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS: &[&str] = &[
     "when",
@@ -515,6 +518,28 @@ fn codex_events() -> Vec<Event> {
             "Updated prompt formatting tests without changing retrieval ranking.",
             "2026-07-20T12:00:00Z",
             &[("fixture", "codex-distractor")],
+        ),
+        event(
+            Source::Codex,
+            "fixture-codex-recall-mentions-disk-agent",
+            "Recall retrieval investigation",
+            "Where did I leave off with disk agent? This recall session mentions disk-agent while debugging retrieval.",
+            "2026-08-29T12:00:00Z",
+            &[
+                ("fixture", "codex-recall-mentions-disk-agent"),
+                ("cwd", "/home/simon/labs/repos/recall"),
+            ],
+        ),
+        event(
+            Source::Codex,
+            "fixture-codex-disk-agent-owned",
+            "Disk-agent diagnostics",
+            "Disk-agent work focused on read-only diagnostics and Cargo target reporting.",
+            "2026-08-29T13:00:00Z",
+            &[
+                ("fixture", "codex-disk-agent-owned"),
+                ("cwd", "/home/simon/labs/repos/disk-agent"),
+            ],
         ),
     ]
 }

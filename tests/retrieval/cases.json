@@ -53,6 +53,19 @@
       "notes": "The important evidence is behavioral, not just the word inspect."
     },
     {
+      "id": "disk-agent-leave-off-project-ownership",
+      "question": "Where did I leave off with disk-agent?",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-disk-agent-owned",
+          "max_rank": 1,
+          "why": "The event belongs to the disk-agent cwd and should outrank a recall session that merely mentions the same phrase."
+        }
+      ],
+      "notes": "Conversational words such as leave/off/with should not block project retrieval, and matching project metadata should dominate incidental text mentions."
+    },
+    {
       "id": "today-recall-work",
       "question": "Summarize today's recall work.",
       "expected": [

@@ -1578,6 +1578,9 @@ const ASK_STOP_WORDS: &[&str] = &[
     "today",
     "todays",
     "work",
+    "leave",
+    "off",
+    "with",
 ];
 const ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS: &[&str] = &[
     "when",
@@ -1855,6 +1858,7 @@ impl Recall {
                 Ok(results)
             })?;
 
+        apply_project_ownership_boost_to_results(query, &mut results);
         sort_search_results(&mut results);
 
         Ok(results)
@@ -1871,6 +1875,7 @@ impl Recall {
                 Ok(results)
             })?;
 
+        apply_project_ownership_boost_to_matches(query, &mut results);
         sort_search_matches(&mut results);
 
         Ok(results)
@@ -1896,6 +1901,7 @@ impl Recall {
         }
 
         let sort_started = Instant::now();
+        apply_project_ownership_boost_to_matches(query, &mut results);
         sort_search_matches(&mut results);
         let sort_ms = elapsed_ms(sort_started);
         let total_ms = elapsed_ms(total_started);
@@ -1972,6 +1978,80 @@ impl Recall {
     }
 }
 
+const PROJECT_OWNERSHIP_SCORE_BOOST: u32 = 1_000;
+
+fn apply_project_ownership_boost_to_results(query: &str, results: &mut [SearchResult]) {
+    let query_terms = normalize_question_words(query);
+    for result in results {
+        if project_metadata_matches_query(&result.metadata, &query_terms) {
+            boost_search_result(result);
+        }
+    }
+}
+
+fn apply_project_ownership_boost_to_matches(query: &str, results: &mut [SearchMatch]) {
+    let query_terms = normalize_question_words(query);
+    for search_match in results {
+        if project_metadata_matches_query(&search_match.event.metadata, &query_terms)
+            || project_metadata_matches_query(&search_match.result.metadata, &query_terms)
+        {
+            boost_search_result(&mut search_match.result);
+        }
+    }
+}
+
+fn boost_search_result(result: &mut SearchResult) {
+    let boosted_score = result
+        .score
+        .unwrap_or(0)
+        .saturating_add(PROJECT_OWNERSHIP_SCORE_BOOST);
+    result.score = Some(boosted_score);
+    result
+        .diagnostics
+        .insert("score".to_string(), boosted_score.to_string());
+    result.diagnostics.insert(
+        "project_metadata_boost".to_string(),
+        PROJECT_OWNERSHIP_SCORE_BOOST.to_string(),
+    );
+}
+
+fn project_metadata_matches_query(metadata: &Metadata, query_terms: &[String]) -> bool {
+    if query_terms.is_empty() {
+        return false;
+    }
+
+    [
+        "cwd",
+        "repo",
+        "repository",
+        "repository_root",
+        "repo_root",
+        "workspace",
+    ]
+    .iter()
+    .filter_map(|key| metadata.get(*key))
+    .any(|value| project_name_matches_query(value, query_terms))
+}
+
+fn project_name_matches_query(value: &str, query_terms: &[String]) -> bool {
+    let name = project_name(value);
+    let project_terms = normalize_question_words(&name);
+    !project_terms.is_empty()
+        && project_terms
+            .iter()
+            .all(|term| query_terms.iter().any(|query_term| query_term == term))
+}
+
+fn project_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(value)
+        .to_string()
+}
+
 fn sort_search_matches(results: &mut [SearchMatch]) {
     results.sort_by(|left, right| compare_search_results(&left.result, &right.result));
 }
@@ -2042,6 +2122,13 @@ mod tests {
             self.score = Some(score);
             self
         }
+
+        fn with_metadata(mut self, key: &str, value: &str) -> Self {
+            self.event
+                .metadata
+                .insert(key.to_string(), value.to_string());
+            self
+        }
     }
 
     impl Adapter for StaticAdapter {
@@ -2054,7 +2141,7 @@ mod tests {
                 event: EventRef::new(self.source.clone(), self.event.id.clone()),
                 score: self.score,
                 snippet: query.to_string(),
-                metadata: Metadata::new(),
+                metadata: self.event.metadata.clone(),
                 diagnostics: Metadata::new(),
             }])
         }
@@ -2214,6 +2301,18 @@ mod tests {
             plan,
             RetrievalPlan::Search {
                 query: "introduce eventref".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_removes_leave_off_conversational_terms() {
+        let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: "disk agent".to_string()
             }
         );
     }
@@ -3132,6 +3231,43 @@ mod tests {
         assert_eq!(results[0].event, EventRef::new(Source::Git, "later"));
         assert_eq!(results[1].event, EventRef::new(Source::Codex, "early"));
         assert!(results.iter().all(|result| result.diagnostics.is_empty()));
+    }
+
+    #[test]
+    fn recall_search_events_prefers_matching_project_metadata() {
+        let mut recall = Recall::new();
+        recall.register(
+            StaticAdapter::new(
+                Source::Codex,
+                "misleading-recall",
+                "Misleading recall session",
+            )
+            .with_score(200)
+            .with_metadata("cwd", "/home/simon/labs/repos/recall"),
+        );
+        recall.register(
+            StaticAdapter::new(Source::Codex, "disk-agent", "Disk agent project session")
+                .with_score(20)
+                .with_metadata("cwd", "/home/simon/labs/repos/disk-agent"),
+        );
+
+        let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+        let RetrievalPlan::Search { query } = plan else {
+            panic!("expected search plan");
+        };
+        let results = recall.search_events(&query).unwrap();
+
+        assert_eq!(query, "disk agent");
+        assert_eq!(results[0].event.id.as_str(), "disk-agent");
+        assert_eq!(
+            results[0]
+                .result
+                .diagnostics
+                .get("project_metadata_boost")
+                .map(String::as_str),
+            Some("1000")
+        );
+        assert_eq!(results[1].event.id.as_str(), "misleading-recall");
     }
 
     #[test]
