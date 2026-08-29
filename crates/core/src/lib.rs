@@ -605,6 +605,7 @@ impl PromptBuilder {
         prompt.push_str("Use ONLY the supplied context.\n\n");
         prompt.push_str("If the context does not contain enough information,\n");
         prompt.push_str("say so.\n\n");
+        prompt.push_str("For time-period questions, phrase the answer as what the supplied evidence shows, not as a complete account of the period. Do not present inferred follow-ups or unresolved items as facts; label them as inference when mentioned.\n\n");
         prompt.push_str("When evidence describes an evolving or contradictory state, distinguish intermediate findings from the latest known state. If later timestamped evidence supersedes earlier state claims, make that final state clear while still preserving the chronology. Describe superseded earlier conclusions as what appeared true, was believed, or was concluded at that point, not as objective final facts.\n\n");
         prompt.push_str("Cite source ids when referring to events.\n\n");
         prompt.push_str("Question:\n\n");
