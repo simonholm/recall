@@ -247,6 +247,25 @@ fn diagnostic_events_as_of(
 ) -> Result<Vec<Event>, String> {
     match plan {
         RetrievalPlan::Search { query } => diagnostic_search_events_as_of(recall, query, as_of),
+        RetrievalPlan::ProjectLatest { query } => {
+            let events = recall
+                .timeline()
+                .map_err(|error| error.to_string())?
+                .events
+                .into_iter()
+                .filter(|event| {
+                    event.timestamp.as_ref().is_some_and(|timestamp| {
+                        timestamp_is_at_or_before(timestamp, as_of)
+                            && recall_core::project_metadata_matches_query_text(
+                                &event.metadata,
+                                query,
+                            )
+                    })
+                })
+                .take(super::ASK_RESULT_LIMIT)
+                .collect();
+            Ok(events)
+        }
         RetrievalPlan::Timeline { range } => {
             let events = recall
                 .timeline()

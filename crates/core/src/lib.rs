@@ -193,6 +193,8 @@ impl Timeline {
 pub enum RetrievalPlan {
     /// Use source-local lexical search with the normalized query.
     Search { query: String },
+    /// Use newest project-owned events for resume/latest-state questions.
+    ProjectLatest { query: String },
     /// Use timeline retrieval for a relative date range.
     Timeline { range: DateRange },
 }
@@ -285,6 +287,12 @@ impl RetrievalPlanner {
         if let Some(days) = last_days_range(&normalized_words) {
             return RetrievalPlan::Timeline {
                 range: DateRange::LastDays(days),
+            };
+        }
+
+        if has_project_latest_intent(&normalized_words) {
+            return RetrievalPlan::ProjectLatest {
+                query: normalize_project_latest_query_words(&normalized_words),
             };
         }
 
@@ -1660,6 +1668,21 @@ fn normalize_ask_query_words(words: &[String]) -> String {
         .join(" ")
 }
 
+fn normalize_project_latest_query_words(words: &[String]) -> String {
+    let normalized = words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| {
+            !ASK_STOP_WORDS.contains(word) && !["resume", "left", "doing", "last"].contains(word)
+        })
+        .collect::<Vec<_>>();
+    if !normalized.is_empty() {
+        return normalized.join(" ");
+    }
+
+    normalize_ask_query_words(words)
+}
+
 fn contains_word(words: &[String], needle: &str) -> bool {
     words.iter().any(|word| word == needle)
 }
@@ -1671,6 +1694,14 @@ fn contains_word_sequence(words: &[String], sequence: &[&str]) -> bool {
             .map(String::as_str)
             .eq(sequence.iter().copied())
     })
+}
+
+fn has_project_latest_intent(words: &[String]) -> bool {
+    contains_word(words, "resume")
+        || contains_word_sequence(words, &["leave", "off"])
+        || contains_word_sequence(words, &["left", "off"])
+        || contains_word_sequence(words, &["doing", "last"])
+        || contains_word_sequence(words, &["last", "doing"])
 }
 
 fn last_days_range(words: &[String]) -> Option<u32> {
@@ -2015,6 +2046,11 @@ fn boost_search_result(result: &mut SearchResult) {
     );
 }
 
+pub fn project_metadata_matches_query_text(metadata: &Metadata, query: &str) -> bool {
+    let query_terms = normalize_question_words(query);
+    project_metadata_matches_query(metadata, &query_terms)
+}
+
 fn project_metadata_matches_query(metadata: &Metadata, query_terms: &[String]) -> bool {
     if query_terms.is_empty() {
         return false;
@@ -2308,6 +2344,42 @@ mod tests {
     #[test]
     fn retrieval_planner_removes_leave_off_conversational_terms() {
         let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::ProjectLatest {
+                query: "disk agent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_classifies_resume_project_questions_as_latest_state() {
+        let plan = RetrievalPlanner::new().plan("Resume disk-agent.");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::ProjectLatest {
+                query: "disk agent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_classifies_doing_last_project_questions_as_latest_state() {
+        let plan = RetrievalPlanner::new().plan("What was I doing last with disk-agent?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::ProjectLatest {
+                query: "disk agent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_keeps_ordinary_project_questions_as_search() {
+        let plan = RetrievalPlanner::new().plan("What is disk-agent?");
 
         assert_eq!(
             plan,
@@ -3251,7 +3323,7 @@ mod tests {
                 .with_metadata("cwd", "/home/simon/labs/repos/disk-agent"),
         );
 
-        let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+        let plan = RetrievalPlanner::new().plan("What is disk-agent?");
         let RetrievalPlan::Search { query } = plan else {
             panic!("expected search plan");
         };

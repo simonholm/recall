@@ -14,9 +14,9 @@ use outbound_audit::OutboundAuditConfig;
 use recall_claude::ClaudeAdapter;
 use recall_codex::CodexAdapter;
 use recall_core::{
-    AdapterCallTiming, ContextCompiler, DateRange, Event, EventId, EventRef, EvidenceBlock,
-    PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch,
-    SearchResult, Source, Timeline, TimelineDiagnostics,
+    project_metadata_matches_query_text, AdapterCallTiming, ContextCompiler, DateRange, Event,
+    EventId, EventRef, EvidenceBlock, PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner,
+    SearchDiagnostics, SearchMatch, SearchResult, Source, Timeline, TimelineDiagnostics,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -542,6 +542,7 @@ fn format_debug_retrieval(
 ) -> String {
     match plan {
         RetrievalPlan::Search { .. } => format_debug_search(search_results),
+        RetrievalPlan::ProjectLatest { .. } => format_debug_timeline(events),
         RetrievalPlan::Timeline { .. } => format_debug_timeline(events),
     }
 }
@@ -886,6 +887,10 @@ fn ask_retrieval(recall: &Recall, plan: &RetrievalPlan) -> Result<AskRetrieval, 
                 search_results,
             })
         }
+        RetrievalPlan::ProjectLatest { query } => Ok(AskRetrieval {
+            events: ask_project_latest_events(recall, query)?,
+            search_results: Vec::new(),
+        }),
         RetrievalPlan::Timeline { range } => Ok(AskRetrieval {
             events: ask_timeline_events(recall, range)?,
             search_results: Vec::new(),
@@ -933,6 +938,45 @@ fn ask_retrieval_with_timings(
                         returned_results,
                     }),
                     timeline: None,
+                    inspect_total_ms,
+                    inspections: Vec::new(),
+                    total_ms,
+                },
+            })
+        }
+        RetrievalPlan::ProjectLatest { query } => {
+            let timeline = recall
+                .timeline_with_diagnostics()
+                .map_err(|error| error.to_string())?;
+            let TimelineDiagnostics {
+                adapter_timelines,
+                sort_ms,
+                total_ms: timeline_total_ms,
+            } = timeline.diagnostics;
+
+            let filter_started = Instant::now();
+            let events: Vec<_> = project_latest_events(timeline.timeline.events, query)
+                .into_iter()
+                .take(ASK_RESULT_LIMIT)
+                .collect();
+            let filter_limit_ms = elapsed_ms(filter_started);
+            let returned_events = events.len();
+            let inspect_total_ms = 0;
+            let total_ms = elapsed_ms(total_started);
+
+            Ok(AskRetrievalWithTimings {
+                events,
+                search_results: Vec::new(),
+                timings: RetrievalTimings {
+                    planning_ms,
+                    search: None,
+                    timeline: Some(TimelineRetrievalTimings {
+                        adapter_timelines,
+                        sort_ms,
+                        total_ms: timeline_total_ms,
+                        filter_limit_ms,
+                        returned_events,
+                    }),
                     inspect_total_ms,
                     inspections: Vec::new(),
                     total_ms,
@@ -1001,8 +1045,26 @@ fn compile_evidence(plan: &RetrievalPlan, question: &str, events: &[Event]) -> V
     let compiler = ContextCompiler::new();
     match plan {
         RetrievalPlan::Search { .. } => compiler.compile(question, events),
+        RetrievalPlan::ProjectLatest { .. } => compiler.compile(question, events),
         RetrievalPlan::Timeline { .. } => compiler.compile_timeline(question, events),
     }
+}
+
+fn ask_project_latest_events(recall: &Recall, query: &str) -> Result<Vec<Event>, String> {
+    Ok(project_latest_events(
+        recall.timeline().map_err(|error| error.to_string())?.events,
+        query,
+    )
+    .into_iter()
+    .take(ASK_RESULT_LIMIT)
+    .collect())
+}
+
+fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|event| project_metadata_matches_query_text(&event.metadata, query))
+        .collect()
 }
 
 fn ask_timeline_events(recall: &Recall, range: &DateRange) -> Result<Vec<Event>, String> {
@@ -1029,6 +1091,7 @@ fn ask_timeline_events(recall: &Recall, range: &DateRange) -> Result<Vec<Event>,
 fn normalize_ask_query(question: &str) -> String {
     match RetrievalPlanner::new().plan(question) {
         RetrievalPlan::Search { query } => query,
+        RetrievalPlan::ProjectLatest { query } => query,
         RetrievalPlan::Timeline { range } => format_date_range(&range),
     }
 }
@@ -1036,6 +1099,7 @@ fn normalize_ask_query(question: &str) -> String {
 fn format_retrieval_plan(plan: &RetrievalPlan) -> String {
     match plan {
         RetrievalPlan::Search { query } => query.clone(),
+        RetrievalPlan::ProjectLatest { query } => format!("project latest {query}"),
         RetrievalPlan::Timeline { range } => format!("timeline {}", format_date_range(range)),
     }
 }
@@ -1495,6 +1559,64 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id.as_str(), "included");
+    }
+
+    #[test]
+    fn ask_project_latest_prefers_newest_same_basename_project_event() {
+        let mut old = Event::new(
+            "old-rust-rewrite",
+            Source::Codex,
+            "disk-agent: Evaluate and propose a Rust migration",
+        );
+        old.timestamp = Some(Timestamp::new("2026-06-29T19:44:14.479Z"));
+        old.description = "The disk-agent project is being rewritten in Rust.".to_string();
+        old.metadata
+            .insert("cwd".to_string(), "/home/simon/disk-agent".to_string());
+
+        let mut current = Event::new(
+            "current-left-off",
+            Source::Codex,
+            "Resume the interrupted disk-agent session from the current working tree.",
+        );
+        current.timestamp = Some(Timestamp::new("2026-08-29T07:15:50.861Z"));
+        current.description =
+            "Committed the intended interrupted work locally; no push was performed.".to_string();
+        current.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/disk-agent".to_string(),
+        );
+
+        let mut unrelated_newer = Event::new(
+            "unrelated-newer",
+            Source::Codex,
+            "Mention disk-agent from Recall",
+        );
+        unrelated_newer.timestamp = Some(Timestamp::new("2026-08-30T07:15:50.861Z"));
+        unrelated_newer.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/recall".to_string(),
+        );
+
+        let mut recall = Recall::new();
+        recall.register(TestAdapter::new(vec![old, current, unrelated_newer]));
+
+        let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+        let retrieval = ask_retrieval(&recall, &plan).unwrap();
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::ProjectLatest {
+                query: "disk agent".to_string()
+            }
+        );
+        assert_eq!(
+            retrieval
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current-left-off", "old-rust-rewrite"]
+        );
     }
 
     #[test]
