@@ -2153,6 +2153,18 @@ mod tests {
     }
 
     #[test]
+    fn prompt_builder_instructs_evidence_bounded_time_period_answers() {
+        let prompt = PromptBuilder::new().build("What did I work on this week?", &[]);
+
+        assert!(prompt.contains(
+            "For time-period questions, phrase the answer as what the supplied evidence shows, not as a complete account of the period."
+        ));
+        assert!(prompt.contains(
+            "Do not present inferred follow-ups or unresolved items as facts; label them as inference when mentioned."
+        ));
+    }
+
+    #[test]
     fn prompt_builder_instructs_latest_timeline_state_to_supersede_intermediate_findings() {
         let earlier = EvidenceBlock {
             source: Source::Codex,
