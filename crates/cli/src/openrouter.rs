@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-pub(crate) const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
+pub(crate) const DEFAULT_MODEL: &str = "google/gemini-2.5-flash-lite";
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const DEFAULT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 120;
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn default_model_literal_requires_intentional_test_update() {
-        assert_eq!(DEFAULT_MODEL, "deepseek/deepseek-v4-flash-0731");
+        assert_eq!(DEFAULT_MODEL, "google/gemini-2.5-flash-lite");
     }
 
     #[test]

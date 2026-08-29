@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "Configuration:\n  Model: deepseek/deepseek-v4-flash-0731\n  API key: no\n\nSearch query:\nask\n\n{prompt}"
+                "Configuration:\n  Model: google/gemini-2.5-flash-lite\n  API key: no\n\nSearch query:\nask\n\n{prompt}"
             )
         );
     }
@@ -1836,7 +1836,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "Configuration:\n  Model: deepseek/deepseek-v4-flash-0731\n  API key: no\n"
+            "Configuration:\n  Model: google/gemini-2.5-flash-lite\n  API key: no\n"
         );
     }
 
