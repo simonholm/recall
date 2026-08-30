@@ -398,6 +398,15 @@ impl ContextCompiler {
             .collect()
     }
 
+    /// Compiles latest-project retrieval as direct evidence from the newest event.
+    pub fn compile_project_latest(&self, question: &str, events: &[Event]) -> Vec<EvidenceBlock> {
+        events
+            .first()
+            .map(|event| compile_project_latest_event(question, event))
+            .into_iter()
+            .collect()
+    }
+
     /// Compiles retrieved events using explicit compiler options.
     pub fn compile_with_options(
         &self,
@@ -803,6 +812,20 @@ fn compile_event(question: &str, event: &Event, order: usize) -> CompiledEvent {
         metadata,
         evidence,
         order,
+    }
+}
+
+fn compile_project_latest_event(question: &str, event: &Event) -> EvidenceBlock {
+    let mut lines = Vec::new();
+    push_metadata_lines(event, &mut lines);
+    push_project_latest_description_lines(question, &event.description, &mut lines);
+
+    EvidenceBlock {
+        source: event.source.clone(),
+        id: event.id.clone(),
+        timestamp: event.timestamp.clone(),
+        title: compile_title(event),
+        body: lines.join("\n"),
     }
 }
 
@@ -1332,6 +1355,7 @@ fn push_selected_description_lines(question: &str, description: &str, lines: &mu
         }
         if is_prompt_scaffolding_line(line.trim_start_matches("- "))
             || is_noise_line(line)
+            || is_project_latest_citation_line(line)
             || is_duplicate_line(lines, line)
         {
             continue;
@@ -1340,6 +1364,114 @@ fn push_selected_description_lines(question: &str, description: &str, lines: &mu
             lines.push(line.to_string());
         }
     }
+}
+
+fn push_project_latest_description_lines(
+    question: &str,
+    description: &str,
+    lines: &mut Vec<String>,
+) {
+    let question_terms = normalize_question_words(question);
+    let mut in_skipped_block = false;
+    let mut keep_fenced_block = false;
+    let mut keep_next_fenced_block = false;
+    let mut keep_list = false;
+
+    for raw_line in description.lines() {
+        let line = raw_line.trim();
+        if starts_skipped_block(line) {
+            in_skipped_block = true;
+            continue;
+        }
+        if in_skipped_block {
+            if ends_skipped_block(line) {
+                in_skipped_block = false;
+            }
+            continue;
+        }
+        if is_prompt_scaffolding_line(line.trim_start_matches("- "))
+            || is_noise_line(line)
+            || is_project_latest_citation_line(line)
+            || is_duplicate_line(lines, line)
+        {
+            continue;
+        }
+
+        if keep_fenced_block {
+            lines.push(line.to_string());
+            if line == "```" {
+                keep_fenced_block = false;
+                keep_next_fenced_block = false;
+            }
+            continue;
+        }
+        if keep_next_fenced_block && line.starts_with("```") {
+            lines.push(line.to_string());
+            if line != "```" {
+                keep_fenced_block = true;
+            }
+            continue;
+        }
+        if keep_list {
+            if line.starts_with("- ") {
+                lines.push(line.to_string());
+                continue;
+            }
+            keep_list = false;
+        }
+
+        if is_high_value_line(line, &question_terms) || is_project_latest_state_line(line) {
+            lines.push(line.to_string());
+            if keeps_following_fenced_block(line) {
+                keep_next_fenced_block = true;
+            }
+            if keeps_following_list(line) {
+                keep_list = true;
+            }
+            if line.starts_with("```") && line != "```" {
+                keep_fenced_block = true;
+            }
+        }
+    }
+}
+
+fn is_project_latest_state_line(line: &str) -> bool {
+    let text = line.to_ascii_lowercase();
+    line.starts_with("Commit:")
+        || line.starts_with("Message:")
+        || line.starts_with("Final git status:")
+        || line.starts_with("No commit was made.")
+        || line.starts_with("No push was performed")
+        || line.starts_with("Do not redo")
+        || line.starts_with("Do not push")
+        || line.starts_with("Do not modify")
+        || line.starts_with("Report the commit hash")
+        || text.contains("ssh connection died")
+        || text.contains("not committed")
+        || text.contains("not pushed")
+        || text.contains("uncommitted")
+        || text.contains("unpushed")
+        || text.contains("ahead ")
+        || text.contains("working tree")
+}
+
+fn keeps_following_fenced_block(line: &str) -> bool {
+    line.starts_with("Final git status:")
+}
+
+fn keeps_following_list(line: &str) -> bool {
+    line.starts_with("Validation passed:")
+}
+
+fn is_project_latest_citation_line(line: &str) -> bool {
+    line == "<oai-mem-citation>"
+        || line == "</oai-mem-citation>"
+        || line == "<citation_entries>"
+        || line == "</citation_entries>"
+        || line == "<rollout_ids>"
+        || line == "</rollout_ids>"
+        || line.starts_with("MEMORY.md:")
+        || line.starts_with("rollout_summaries/")
 }
 
 fn push_git_description_lines(description: &str, lines: &mut Vec<String>) {
@@ -3032,6 +3164,47 @@ mod tests {
         assert!(evidence[1]
             .body
             .contains("Decision: build ProjectState internally."));
+    }
+
+    #[test]
+    fn context_compiler_project_latest_keeps_newest_event_direct() {
+        let mut latest = Event::new("latest", Source::Codex, "Resume disk-agent");
+        latest.timestamp = Some(Timestamp::new("2026-08-29T07:15:50.861Z"));
+        latest.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/disk-agent".to_string(),
+        );
+        latest.description = concat!(
+            "Commit: `ca46c169efa06389002a0157da5857a22f564bc7`\n",
+            "Validation passed:\n",
+            "- `cargo test`\n",
+            "Final git status:\n",
+            "```text\n",
+            "## main...origin/main [ahead 1]\n",
+            "```\n",
+            "No push was performed."
+        )
+        .to_string();
+        let mut older = Event::new("older", Source::Codex, "Implemented Podman attribution");
+        older.timestamp = Some(Timestamp::new("2026-08-15T09:48:49.847Z"));
+        older.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/disk-agent".to_string(),
+        );
+        older.description = "Implemented the minimal Podman attribution change.".to_string();
+
+        let evidence = ContextCompiler::new()
+            .compile_project_latest("Where did I leave off with disk-agent?", &[latest, older]);
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id.as_str(), "latest");
+        assert_eq!(evidence[0].title, "Resume disk-agent");
+        assert!(evidence[0]
+            .body
+            .contains("ca46c169efa06389002a0157da5857a22f564bc7"));
+        assert!(evidence[0].body.contains("`cargo test`"));
+        assert!(evidence[0].body.contains("## main...origin/main [ahead 1]"));
+        assert!(!evidence[0].body.contains("Podman"));
     }
 
     #[test]

@@ -1045,7 +1045,7 @@ fn compile_evidence(plan: &RetrievalPlan, question: &str, events: &[Event]) -> V
     let compiler = ContextCompiler::new();
     match plan {
         RetrievalPlan::Search { .. } => compiler.compile(question, events),
-        RetrievalPlan::ProjectLatest { .. } => compiler.compile(question, events),
+        RetrievalPlan::ProjectLatest { .. } => compiler.compile_project_latest(question, events),
         RetrievalPlan::Timeline { .. } => compiler.compile_timeline(question, events),
     }
 }
@@ -1722,6 +1722,97 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].id.as_str(), "project:/repo/recall");
         assert_eq!(evidence[0].title, "Project: /repo/recall");
+    }
+
+    #[test]
+    fn project_latest_evidence_uses_newest_resumable_event_without_older_project_history() {
+        let mut latest = Event::new(
+            "latest-disk-agent",
+            Source::Codex,
+            "Resume the interrupted disk-agent session from the current working tree.",
+        );
+        latest.timestamp = Some(Timestamp::new("2026-08-29T07:15:50.861Z"));
+        latest.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/disk-agent".to_string(),
+        );
+        latest.description = concat!(
+            "Resume the interrupted disk-agent session from the current working tree.\n\n",
+            "The previous session completed the implementation and validation, but the SSH connection died while attempting to stage/commit. Do not redo or expand the implementation.\n\n",
+            "Committed the intended interrupted work locally.\n\n",
+            "Commit: `ca46c169efa06389002a0157da5857a22f564bc7`\n",
+            "Message: `Improve disk investigation diagnostics`\n\n",
+            "Validation passed:\n",
+            "- `cargo fmt --check`\n",
+            "- `git diff --check`\n",
+            "- `cargo test` with 57 total tests passing plus doc-tests\n\n",
+            "Final git status:\n",
+            "```text\n",
+            "## main...origin/main [ahead 1]\n",
+            "```\n\n",
+            "No push was performed, and the working tree has no remaining diff.\n\n",
+            "<oai-mem-citation>\n",
+            "<citation_entries>\n",
+            "MEMORY.md:2151-2155|note=[disk-agent prior validation context]\n",
+            "</citation_entries>\n",
+            "</oai-mem-citation>"
+        )
+        .to_string();
+
+        let mut older_podman = Event::new(
+            "older-podman",
+            Source::Codex,
+            "The new Podman attribution is not rendering in a real run.",
+        );
+        older_podman.timestamp = Some(Timestamp::new("2026-08-15T09:56:14.271Z"));
+        older_podman.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/disk-agent".to_string(),
+        );
+        older_podman.description = concat!(
+            "The new Podman attribution is not rendering in a real run.\n",
+            "The real Podman output reveals the parsing bug.\n",
+            "Implemented the scoped fix in src/podman.rs: container attribution now reads Size.rwSize."
+        )
+        .to_string();
+
+        let mut recall = Recall::new();
+        recall.register(TestAdapter::new(vec![older_podman, latest]));
+
+        let plan = RetrievalPlanner::new().plan("Where did I leave off with disk-agent?");
+        let retrieval = ask_retrieval(&recall, &plan).unwrap();
+        let evidence = compile_evidence(
+            &plan,
+            "Where did I leave off with disk-agent?",
+            &retrieval.events,
+        );
+
+        assert_eq!(
+            retrieval
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["latest-disk-agent", "older-podman"]
+        );
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id.as_str(), "latest-disk-agent");
+        assert_eq!(
+            evidence[0].title,
+            "Resume the interrupted disk-agent session from the current working tree."
+        );
+        assert!(evidence[0]
+            .body
+            .contains("ca46c169efa06389002a0157da5857a22f564bc7"));
+        assert!(evidence[0].body.contains("Validation passed:"));
+        assert!(evidence[0].body.contains("`cargo test`"));
+        assert!(evidence[0].body.contains("Final git status:"));
+        assert!(evidence[0].body.contains("## main...origin/main [ahead 1]"));
+        assert!(evidence[0].body.contains("No push was performed"));
+        assert!(!evidence[0].body.contains("Podman"));
+        assert!(!evidence[0].body.contains("Size.rwSize"));
+        assert!(!evidence[0].body.contains("MEMORY.md"));
+        assert!(!evidence[0].body.contains("oai-mem-citation"));
     }
 
     #[test]
