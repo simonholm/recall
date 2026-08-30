@@ -94,15 +94,10 @@ impl CodexAdapter {
         let mut builder = SessionBuilder::new(path);
 
         for (line_index, line) in text.lines().enumerate() {
-            let value = serde_json::from_str::<Value>(line).map_err(|error| {
-                self.error(format!(
-                    "failed to parse session file {} line {}: {error}",
-                    path.display(),
-                    line_index + 1
-                ))
-            })?;
-
-            builder.record(&value);
+            match serde_json::from_str::<Value>(line) {
+                Ok(value) => builder.record(&value),
+                Err(error) => builder.record_skipped_line(line_index + 1, &error),
+            }
         }
 
         Ok(builder.finish())
@@ -214,6 +209,26 @@ impl SessionBuilder {
             Some("response_item") => self.record_response_item(value),
             _ => {}
         }
+    }
+
+    fn record_skipped_line(&mut self, line_number: usize, error: &serde_json::Error) {
+        let count = self
+            .metadata
+            .get("skipped_records")
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0)
+            + 1;
+
+        self.metadata
+            .insert("skipped_records".to_string(), count.to_string());
+        let diagnostic = format!("{} line {}: {error}", self.path.display(), line_number);
+        self.metadata
+            .entry("skipped_record_diagnostic".to_string())
+            .and_modify(|existing| {
+                existing.push_str("; ");
+                existing.push_str(&diagnostic);
+            })
+            .or_insert(diagnostic);
     }
 
     fn record_session_meta(&mut self, value: &Value) {
@@ -902,22 +917,100 @@ mod tests {
     }
 
     #[test]
-    fn malformed_session_files_return_error() {
-        let sessions_dir = temp_sessions_dir("malformed");
-        write_session(&sessions_dir, "bad.jsonl", "not json");
+    fn malformed_record_does_not_discard_later_valid_session_records() {
+        let sessions_dir = temp_sessions_dir("malformed-record");
         write_session(
             &sessions_dir,
-            "good.jsonl",
-            r#"{"type":"session_meta","payload":{"id":"session-3"}}"#,
+            "session.jsonl",
+            r#"{"type":"session_meta","payload":{"id":"session-malformed"}}"#,
+        );
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Ingest valid records before malformed lines"}]}}"#,
+        );
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"This assistant record is truncated"#,
+        );
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"A replacement assistant record after the malformed line is retained."}]}}"#,
         );
 
-        let error = CodexAdapter::with_sessions_dir(&sessions_dir)
+        let events = CodexAdapter::with_sessions_dir(&sessions_dir)
             .scan()
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.source, Source::Codex);
-        assert!(error.message.contains("failed to parse session file"));
-        assert!(error.message.contains("bad.jsonl line 1"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id.as_str(), "session-malformed");
+        assert_eq!(
+            events[0].title,
+            "Ingest valid records before malformed lines"
+        );
+        assert!(events[0].description.contains("valid records before"));
+        assert!(events[0]
+            .description
+            .contains("replacement assistant record after the malformed line"));
+        assert!(!events[0]
+            .description
+            .contains("This assistant record is truncated"));
+        assert_eq!(
+            events[0]
+                .metadata
+                .get("skipped_records")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(events[0]
+            .metadata
+            .get("skipped_record_diagnostic")
+            .is_some_and(|diagnostic| diagnostic.contains("session.jsonl line 3")));
+    }
+
+    #[test]
+    fn skipped_record_diagnostic_retains_multiple_malformed_line_numbers() {
+        let sessions_dir = temp_sessions_dir("multiple-malformed-records");
+        write_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"session_meta","payload":{"id":"session-multiple-malformed"}}"#,
+        );
+        append_session(&sessions_dir, "session.jsonl", "not json");
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Continue after first malformed record"}]}}"#,
+        );
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second malformed"#,
+        );
+        append_session(
+            &sessions_dir,
+            "session.jsonl",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Continue after second malformed record."}]}}"#,
+        );
+
+        let events = CodexAdapter::with_sessions_dir(&sessions_dir)
+            .scan()
+            .unwrap();
+        let diagnostic = events[0].metadata.get("skipped_record_diagnostic").unwrap();
+
+        assert_eq!(
+            events[0]
+                .metadata
+                .get("skipped_records")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(diagnostic.contains("session.jsonl line 2"));
+        assert!(diagnostic.contains("session.jsonl line 4"));
+        assert!(events[0].description.contains("Continue after first"));
+        assert!(events[0].description.contains("Continue after second"));
     }
 
     fn temp_sessions_dir(label: &str) -> PathBuf {
