@@ -27,11 +27,26 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 const ASK_RESULT_LIMIT: usize = 8;
+const CLI_VERSION: &str = cli_version(
+    option_env!("RECALL_LONG_VERSION"),
+    env!("CARGO_PKG_VERSION"),
+);
+
+const fn cli_version(
+    long_version: Option<&'static str>,
+    package_version: &'static str,
+) -> &'static str {
+    match long_version {
+        Some(version) => version,
+        None => package_version,
+    }
+}
 
 /// Local development memory CLI.
 #[derive(Debug, Parser)]
 #[command(name = "recall")]
 #[command(about = "Local development memory system")]
+#[command(version = CLI_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -1347,6 +1362,27 @@ mod tests {
     #[test]
     fn clap_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn clap_version_uses_package_version() {
+        let error = Cli::command()
+            .try_get_matches_from(["recall", "--version"])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error
+            .to_string()
+            .starts_with(&format!("recall {}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn cli_version_uses_build_metadata_when_available() {
+        assert_eq!(
+            cli_version(Some("0.1.0 (922eafb-dirty)"), "0.1.0"),
+            "0.1.0 (922eafb-dirty)"
+        );
+        assert_eq!(cli_version(None, "0.1.0"), "0.1.0");
     }
 
     #[test]
