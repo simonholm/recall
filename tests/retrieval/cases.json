@@ -8,17 +8,37 @@
         {
           "source": "codex",
           "id": "fixture-codex-eventref",
-          "max_rank": 5,
+          "max_rank": 1,
           "why": "The Codex session discusses replacing embedded events with source-qualified references."
-        },
+        }
+      ],
+      "notes": "A rationale question should favor the discussion that explains why EventRef was introduced, even when a related Git commit also exists."
+    },
+    {
+      "id": "eventref-landed-change",
+      "question": "What EventRef change actually landed?",
+      "expected": [
         {
           "source": "git",
           "id": "fixture-git-eventref",
           "max_rank": 1,
-          "why": "The commit records the landed core model change."
+          "why": "The Git commit records the refined EventRef core model as the landed change."
         }
       ],
-      "notes": "A lexical query should find durable terms such as eventref and introduce."
+      "notes": "A completed-change question should favor the commit evidence, even when the wording does not mirror the commit title."
+    },
+    {
+      "id": "eventref-discussion-history",
+      "question": "Did I discuss EventRef?",
+      "expected": [
+        {
+          "source": "codex",
+          "id": "fixture-codex-eventref",
+          "max_rank": 1,
+          "why": "The Codex session explicitly records the EventRef discussion."
+        }
+      ],
+      "notes": "A discussion-history question should favor conversational evidence over the implementation commit."
     },
     {
       "id": "git-adapter-implementation",
