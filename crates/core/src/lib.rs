@@ -2488,7 +2488,7 @@ fn timeline_events(
     query: &str,
     today: NaiveDate,
 ) -> Vec<Event> {
-    let events = events
+    let in_range = events
         .into_iter()
         .filter(|event| {
             event
@@ -2496,8 +2496,21 @@ fn timeline_events(
                 .as_ref()
                 .is_some_and(|timestamp| range.contains_timestamp_on(timestamp, today))
         })
-        .filter(|event| event_matches_query(event, query))
         .collect::<Vec<_>>();
+
+    let narrowed = in_range
+        .iter()
+        .filter(|event| event_matches_query(event, query))
+        .cloned()
+        .collect::<Vec<_>>();
+    // A subject term absent from the recognized vocabulary (see
+    // TEMPORAL_SUBJECT_STOP_WORDS) must not silently empty an otherwise
+    // populated range: fall back to the unnarrowed range in that case.
+    let events = if narrowed.is_empty() {
+        in_range
+    } else {
+        narrowed
+    };
 
     match range {
         DateRange::Day(_) => events,
@@ -4069,6 +4082,26 @@ mod tests {
                 .map(String::as_str),
             Some("change actually landed")
         );
+    }
+
+    #[test]
+    fn ask_retrieval_timeline_falls_back_to_full_range_when_subject_terms_match_nothing() {
+        let mut event = Event::new("today-event", Source::Codex, "Deployed the release");
+        event.timestamp = Some(Timestamp::new("2026-08-31T09:00:00Z"));
+        event.description = "Shipped the release to production.".to_string();
+        let mut recall = Recall::new();
+        recall.register(StaticAdapter::new_with_event(Source::Codex, event));
+
+        let plan = RetrievalPlan::Timeline {
+            range: DateRange::Today,
+            query: "wrap up".to_string(),
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        let retrieval = recall.ask_retrieval_on(&plan, today).unwrap();
+
+        assert_eq!(retrieval.events.len(), 1);
+        assert_eq!(retrieval.events[0].id.as_str(), "today-event");
     }
 
     #[test]

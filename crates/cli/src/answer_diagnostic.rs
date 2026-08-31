@@ -269,7 +269,7 @@ fn diagnostic_events_as_of(
             Ok(events)
         }
         RetrievalPlan::Timeline { range, query } => {
-            let events = recall
+            let in_range: Vec<_> = recall
                 .timeline()
                 .map_err(|error| error.to_string())?
                 .events
@@ -280,11 +280,21 @@ fn diagnostic_events_as_of(
                             && timestamp_is_at_or_before(timestamp, as_of)
                     })
                 })
-                .filter(|event| super::event_matches_query(event, query));
+                .collect();
+            let narrowed: Vec<_> = in_range
+                .iter()
+                .filter(|event| super::event_matches_query(event, query))
+                .cloned()
+                .collect();
+            let events = if narrowed.is_empty() {
+                in_range
+            } else {
+                narrowed
+            };
 
             match range {
-                recall_core::DateRange::Day(_) => Ok(events.collect()),
-                _ => Ok(events.take(super::ASK_RESULT_LIMIT).collect()),
+                recall_core::DateRange::Day(_) => Ok(events),
+                _ => Ok(events.into_iter().take(super::ASK_RESULT_LIMIT).collect()),
             }
         }
     }

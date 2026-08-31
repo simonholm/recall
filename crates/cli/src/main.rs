@@ -1049,7 +1049,7 @@ fn ask_retrieval_with_timings(
             } = timeline.diagnostics;
 
             let filter_started = Instant::now();
-            let events: Vec<_> = timeline
+            let in_range: Vec<_> = timeline
                 .timeline
                 .events
                 .into_iter()
@@ -1059,8 +1059,17 @@ fn ask_retrieval_with_timings(
                         .as_ref()
                         .is_some_and(|timestamp| range.contains_timestamp(timestamp))
                 })
-                .filter(|event| event_matches_query(event, query))
                 .collect();
+            let narrowed: Vec<_> = in_range
+                .iter()
+                .filter(|event| event_matches_query(event, query))
+                .cloned()
+                .collect();
+            let events = if narrowed.is_empty() {
+                in_range
+            } else {
+                narrowed
+            };
             let events = match range {
                 DateRange::Day(_) => events,
                 _ => events.into_iter().take(ASK_RESULT_LIMIT).collect(),
@@ -1114,7 +1123,7 @@ fn ask_timeline_events(
     range: &DateRange,
     query: &str,
 ) -> Result<Vec<Event>, String> {
-    let events: Vec<_> = recall
+    let in_range: Vec<_> = recall
         .timeline()
         .map_err(|error| error.to_string())?
         .events
@@ -1125,8 +1134,17 @@ fn ask_timeline_events(
                 .as_ref()
                 .is_some_and(|timestamp| range.contains_timestamp(timestamp))
         })
-        .filter(|event| event_matches_query(event, query))
         .collect();
+    let narrowed: Vec<_> = in_range
+        .iter()
+        .filter(|event| event_matches_query(event, query))
+        .cloned()
+        .collect();
+    let events = if narrowed.is_empty() {
+        in_range
+    } else {
+        narrowed
+    };
 
     match range {
         DateRange::Day(_) => Ok(events),
