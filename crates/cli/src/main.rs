@@ -13,10 +13,13 @@ use openrouter::{AuthStatus, LlmDiagnostics, OpenRouterConfig};
 use outbound_audit::OutboundAuditConfig;
 use recall_claude::ClaudeAdapter;
 use recall_codex::CodexAdapter;
+#[cfg(test)]
+use recall_core::ContextCompiler;
 use recall_core::{
-    project_metadata_matches_query_text, AdapterCallTiming, ContextCompiler, DateRange, Event,
+    compile_ask_evidence, project_metadata_matches_query_text, AdapterCallTiming, DateRange, Event,
     EventId, EventRef, EvidenceBlock, PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner,
     SearchDiagnostics, SearchMatch, SearchResult, Source, Timeline, TimelineDiagnostics,
+    ASK_RESULT_LIMIT,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -26,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Instant;
 
-const ASK_RESULT_LIMIT: usize = 8;
 const CLI_VERSION: &str = cli_version(
     option_env!("RECALL_LONG_VERSION"),
     env!("CARGO_PKG_VERSION"),
@@ -919,15 +921,6 @@ fn append_ask_timings_output(output: &mut String, timings: &AskTimings) {
     writeln!(output, "  Total ask: {} ms", timings.total_ms).unwrap();
 }
 
-fn ask_search_matches(recall: &Recall, search_query: &str) -> Result<Vec<SearchMatch>, String> {
-    Ok(recall
-        .search_events(search_query)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .take(ASK_RESULT_LIMIT)
-        .collect())
-}
-
 struct AskRetrieval {
     events: Vec<Event>,
     search_results: Vec<SearchResult>,
@@ -949,24 +942,13 @@ impl AskRetrievalWithTimings {
 }
 
 fn ask_retrieval(recall: &Recall, plan: &RetrievalPlan) -> Result<AskRetrieval, String> {
-    match plan {
-        RetrievalPlan::Search { query } => {
-            let search_matches = ask_search_matches(recall, query)?;
-            let (search_results, events) = split_search_matches(search_matches);
-            Ok(AskRetrieval {
-                events,
-                search_results,
-            })
-        }
-        RetrievalPlan::ProjectLatest { query } => Ok(AskRetrieval {
-            events: ask_project_latest_events(recall, query)?,
-            search_results: Vec::new(),
-        }),
-        RetrievalPlan::Timeline { range, query } => Ok(AskRetrieval {
-            events: ask_timeline_events(recall, range, query)?,
-            search_results: Vec::new(),
-        }),
-    }
+    let retrieval = recall
+        .ask_retrieval(plan)
+        .map_err(|error| error.to_string())?;
+    Ok(AskRetrieval {
+        events: retrieval.events,
+        search_results: retrieval.search_results,
+    })
 }
 
 fn ask_retrieval_with_timings(
@@ -1114,22 +1096,7 @@ fn split_search_matches(search_matches: Vec<SearchMatch>) -> (Vec<SearchResult>,
 }
 
 fn compile_evidence(plan: &RetrievalPlan, question: &str, events: &[Event]) -> Vec<EvidenceBlock> {
-    let compiler = ContextCompiler::new();
-    match plan {
-        RetrievalPlan::Search { .. } => compiler.compile(question, events),
-        RetrievalPlan::ProjectLatest { .. } => compiler.compile_project_latest(question, events),
-        RetrievalPlan::Timeline { .. } => compiler.compile_timeline(question, events),
-    }
-}
-
-fn ask_project_latest_events(recall: &Recall, query: &str) -> Result<Vec<Event>, String> {
-    Ok(project_latest_events(
-        recall.timeline().map_err(|error| error.to_string())?.events,
-        query,
-    )
-    .into_iter()
-    .take(ASK_RESULT_LIMIT)
-    .collect())
+    compile_ask_evidence(plan, question, events)
 }
 
 fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
@@ -1139,6 +1106,7 @@ fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
         .collect()
 }
 
+#[cfg(test)]
 fn ask_timeline_events(
     recall: &Recall,
     range: &DateRange,

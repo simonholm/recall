@@ -217,8 +217,14 @@ pub enum DateRange {
 impl DateRange {
     /// Returns true when a source timestamp falls within this relative range.
     pub fn contains_timestamp(&self, timestamp: &Timestamp) -> bool {
+        self.contains_timestamp_on(timestamp, Local::now().date_naive())
+    }
+
+    /// Returns true when a source timestamp falls within this range relative to
+    /// the supplied local date.
+    pub fn contains_timestamp_on(&self, timestamp: &Timestamp, today: NaiveDate) -> bool {
         parse_timestamp_date(timestamp)
-            .map(|date| self.contains_date(date, Local::now().date_naive()))
+            .map(|date| self.contains_date(date, today))
             .unwrap_or(false)
     }
 
@@ -339,6 +345,16 @@ pub struct SearchResult {
 pub struct SearchMatch {
     pub result: SearchResult,
     pub event: Event,
+}
+
+/// Number of retrieval items included in `recall ask` before context compilation.
+pub const ASK_RESULT_LIMIT: usize = 8;
+
+/// Events and ranked search results selected for an ask retrieval plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AskRetrieval {
+    pub events: Vec<Event>,
+    pub search_results: Vec<SearchResult>,
 }
 
 /// LLM-facing context compiled from a source event.
@@ -2199,6 +2215,136 @@ impl Recall {
         }
 
         Ok(None)
+    }
+
+    /// Retrieves the events used by `recall ask` for a planned question.
+    pub fn ask_retrieval(&self, plan: &RetrievalPlan) -> AdapterResult<AskRetrieval> {
+        self.ask_retrieval_on(plan, Local::now().date_naive())
+    }
+
+    /// Retrieves ask evidence using an explicit local date for relative ranges.
+    pub fn ask_retrieval_on(
+        &self,
+        plan: &RetrievalPlan,
+        today: NaiveDate,
+    ) -> AdapterResult<AskRetrieval> {
+        match plan {
+            RetrievalPlan::Search { query } => {
+                let search_matches = self
+                    .search_events(query)?
+                    .into_iter()
+                    .take(ASK_RESULT_LIMIT)
+                    .collect();
+                let (search_results, events) = split_search_matches(search_matches);
+                Ok(AskRetrieval {
+                    events,
+                    search_results,
+                })
+            }
+            RetrievalPlan::ProjectLatest { query } => Ok(AskRetrieval {
+                events: project_latest_events(self.timeline()?.events, query)
+                    .into_iter()
+                    .take(ASK_RESULT_LIMIT)
+                    .collect(),
+                search_results: Vec::new(),
+            }),
+            RetrievalPlan::Timeline { range, query } => {
+                let events = timeline_events(self.timeline()?.events, range, query, today);
+                Ok(AskRetrieval {
+                    events,
+                    search_results: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+/// Compiles ask retrieval events with the same plan-specific compiler branch as the CLI.
+pub fn compile_ask_evidence(
+    plan: &RetrievalPlan,
+    question: &str,
+    events: &[Event],
+) -> Vec<EvidenceBlock> {
+    let compiler = ContextCompiler::new();
+    match plan {
+        RetrievalPlan::Search { .. } => compiler.compile(question, events),
+        RetrievalPlan::ProjectLatest { .. } => compiler.compile_project_latest(question, events),
+        RetrievalPlan::Timeline { .. } => compiler.compile_timeline(question, events),
+    }
+}
+
+fn split_search_matches(search_matches: Vec<SearchMatch>) -> (Vec<SearchResult>, Vec<Event>) {
+    search_matches
+        .into_iter()
+        .map(|search_match| (search_match.result, search_match.event))
+        .unzip()
+}
+
+fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|event| project_metadata_matches_query_text(&event.metadata, query))
+        .collect()
+}
+
+fn event_matches_query(event: &Event, query: &str) -> bool {
+    let query_terms = normalized_query_terms(query);
+    if query_terms.is_empty() {
+        return true;
+    }
+
+    let mut haystack = String::new();
+    haystack.push_str(&event.title);
+    haystack.push(' ');
+    haystack.push_str(&event.description);
+    for (key, value) in &event.metadata {
+        haystack.push(' ');
+        haystack.push_str(key);
+        haystack.push(' ');
+        haystack.push_str(value);
+    }
+    let haystack_terms = normalized_query_terms(&haystack);
+
+    query_terms.iter().all(|term| {
+        haystack_terms
+            .iter()
+            .any(|haystack_term| haystack_term == term)
+    })
+}
+
+fn normalized_query_terms(text: &str) -> Vec<String> {
+    let mut normalized = String::new();
+    for character in text.chars() {
+        if character.is_alphanumeric() || character.is_whitespace() {
+            normalized.extend(character.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+
+    normalized.split_whitespace().map(str::to_string).collect()
+}
+
+fn timeline_events(
+    events: Vec<Event>,
+    range: &DateRange,
+    query: &str,
+    today: NaiveDate,
+) -> Vec<Event> {
+    let events = events
+        .into_iter()
+        .filter(|event| {
+            event
+                .timestamp
+                .as_ref()
+                .is_some_and(|timestamp| range.contains_timestamp_on(timestamp, today))
+        })
+        .filter(|event| event_matches_query(event, query))
+        .collect::<Vec<_>>();
+
+    match range {
+        DateRange::Day(_) => events,
+        _ => events.into_iter().take(ASK_RESULT_LIMIT).collect(),
     }
 }
 

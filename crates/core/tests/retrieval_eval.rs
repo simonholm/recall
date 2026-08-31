@@ -1,91 +1,15 @@
+use chrono::NaiveDate;
 use recall_core::{
-    Adapter, AdapterResult, Event, EventId, EventRef, Metadata, Recall, SearchResult, Source,
+    compile_ask_evidence, Adapter, AdapterResult, AskRetrieval, Event, EventId, EventRef,
+    EvidenceBlock, Metadata, Recall, RetrievalPlan, RetrievalPlanner, SearchResult, Source,
     Timeline, Timestamp,
 };
 use serde_json::Value;
 
 const CASES_JSON: &str = include_str!("../../../tests/retrieval/cases.json");
 const DEFAULT_MAX_RANK: usize = 5;
-const ASK_STOP_WORDS: &[&str] = &[
-    "when",
-    "what",
-    "why",
-    "where",
-    "who",
-    "how",
-    "did",
-    "do",
-    "does",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "behave",
-    "has",
-    "have",
-    "had",
-    "should",
-    "the",
-    "a",
-    "an",
-    "to",
-    "of",
-    "for",
-    "in",
-    "on",
-    "at",
-    "my",
-    "i",
-    "me",
-    "summarize",
-    "summary",
-    "today",
-    "todays",
-    "work",
-    "leave",
-    "off",
-    "with",
-];
-const ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS: &[&str] = &[
-    "when",
-    "what",
-    "why",
-    "where",
-    "who",
-    "how",
-    "did",
-    "do",
-    "does",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "behave",
-    "has",
-    "have",
-    "had",
-    "should",
-    "the",
-    "a",
-    "an",
-    "to",
-    "of",
-    "for",
-    "in",
-    "on",
-    "at",
-    "my",
-    "i",
-    "me",
-    "summarize",
-    "summary",
-    "today",
-    "todays",
-];
+// Fixture events are dated relative to this corpus anchor, not wall-clock time.
+const EVAL_TODAY: &str = "2026-08-03";
 
 #[test]
 fn retrieval_eval_report_is_reproducible() {
@@ -119,18 +43,28 @@ fn retrieval_eval_verbose_report_includes_failed_ranked_results() {
 
 fn run_evaluation(cases: &[EvalCase], verbose: bool) -> Result<String, String> {
     let recall = fixture_recall();
+    let today = NaiveDate::parse_from_str(EVAL_TODAY, "%Y-%m-%d").map_err(|e| e.to_string())?;
     let mut reports = Vec::new();
 
     for case in cases {
-        let query = normalize_ask_query(&case.question);
-        let results = recall.search(&query).map_err(|error| error.to_string())?;
-        reports.push(evaluate_case(case, &query, &results));
+        let plan = RetrievalPlanner::new().plan(&case.question);
+        let retrieval = recall
+            .ask_retrieval_on(&plan, today)
+            .map_err(|error| error.to_string())?;
+        let evidence = compile_ask_evidence(&plan, &case.question, &retrieval.events);
+        reports.push(evaluate_case(case, &plan, retrieval, evidence));
     }
 
     Ok(format_report(&reports, verbose))
 }
 
-fn evaluate_case(case: &EvalCase, query: &str, results: &[SearchResult]) -> CaseReport {
+fn evaluate_case(
+    case: &EvalCase,
+    plan: &RetrievalPlan,
+    retrieval: AskRetrieval,
+    evidence: Vec<EvidenceBlock>,
+) -> CaseReport {
+    let evaluation = EvaluationOutput::from_plan(plan, &retrieval.search_results, &evidence);
     let expected = case
         .expected
         .iter()
@@ -138,23 +72,24 @@ fn evaluate_case(case: &EvalCase, query: &str, results: &[SearchResult]) -> Case
             let matched = std::iter::once(&expected.event)
                 .chain(expected.alternatives.iter())
                 .find_map(|candidate| {
-                    results
+                    evaluation
+                        .events
                         .iter()
-                        .position(|result| result.event == *candidate)
+                        .position(|event| event == candidate)
                         .map(|index| MatchedResult {
                             event: candidate.clone(),
-                            rank: index + 1,
+                            position: index + 1,
                         })
                 });
 
             let status = match matched {
-                Some(matched) if matched.rank <= expected.max_rank => ExpectedStatus::Found {
+                Some(matched) if matched.position <= expected.max_rank => ExpectedStatus::Found {
                     event: matched.event,
-                    rank: matched.rank,
+                    position: matched.position,
                 },
                 Some(matched) => ExpectedStatus::BelowRank {
                     event: matched.event,
-                    rank: matched.rank,
+                    position: matched.position,
                     max_rank: expected.max_rank,
                 },
                 None => ExpectedStatus::Missing,
@@ -175,9 +110,11 @@ fn evaluate_case(case: &EvalCase, query: &str, results: &[SearchResult]) -> Case
     CaseReport {
         id: case.id.clone(),
         question: case.question.clone(),
-        query: query.to_string(),
+        plan: format_retrieval_plan(plan),
+        evaluation,
+        retrieved_events: retrieval.events,
+        evidence,
         expected,
-        results: results.to_vec(),
         passed,
     }
 }
@@ -192,28 +129,55 @@ fn format_report(reports: &[CaseReport], verbose: bool) -> String {
         output.push_str("  question: ");
         output.push_str(&report.question);
         output.push('\n');
-        output.push_str("  query: ");
-        output.push_str(&report.query);
+        output.push_str("  plan: ");
+        output.push_str(&report.plan);
         output.push('\n');
 
         for expected in &report.expected {
             output.push_str("  expected: ");
             output.push_str(&format_event_ref(&expected.expected));
-            output.push_str(" <= rank ");
+            output.push_str(" <= ");
+            output.push_str(report.evaluation.position_label);
+            output.push(' ');
             output.push_str(&expected.max_rank.to_string());
             output.push('\n');
             output.push_str("  ");
-            output.push_str(&format_expected_status(&expected.status));
+            output.push_str(&format_expected_status(
+                &expected.status,
+                report.evaluation.position_label,
+            ));
             output.push('\n');
         }
 
         if verbose {
-            output.push_str("  ranked results:\n");
-            if report.results.is_empty() {
-                output.push_str("    (none)\n");
+            if !report.evaluation.search_results.is_empty()
+                || matches!(report.evaluation.kind, EvaluationKind::Search)
+            {
+                output.push_str("  ranked results:\n");
+                if report.evaluation.search_results.is_empty() {
+                    output.push_str("    (none)\n");
+                } else {
+                    for (index, result) in report.evaluation.search_results.iter().enumerate() {
+                        append_verbose_result(&mut output, index + 1, result);
+                    }
+                }
             } else {
-                for (index, result) in report.results.iter().enumerate() {
-                    append_verbose_result(&mut output, index + 1, result);
+                output.push_str("  retrieved events:\n");
+                if report.retrieved_events.is_empty() {
+                    output.push_str("    (none)\n");
+                } else {
+                    for (index, event) in report.retrieved_events.iter().enumerate() {
+                        append_verbose_event(&mut output, index + 1, event);
+                    }
+                }
+
+                output.push_str("  compiled evidence:\n");
+                if report.evidence.is_empty() {
+                    output.push_str("    (none)\n");
+                } else {
+                    for (index, evidence) in report.evidence.iter().enumerate() {
+                        append_verbose_evidence(&mut output, index + 1, evidence);
+                    }
                 }
             }
         }
@@ -227,13 +191,19 @@ fn format_report(reports: &[CaseReport], verbose: bool) -> String {
     output.push_str("Queries : ");
     output.push_str(&summary.queries.to_string());
     output.push('\n');
-    output.push_str("Top-1   : ");
+    output.push_str("Search  : ");
+    output.push_str(&summary.search_queries.to_string());
+    output.push('\n');
+    output.push_str("Evidence: ");
+    output.push_str(&summary.evidence_queries.to_string());
+    output.push('\n');
+    output.push_str("Search Top-1   : ");
     output.push_str(&summary.top_1.to_string());
     output.push('\n');
-    output.push_str("Top-3   : ");
+    output.push_str("Search Top-3   : ");
     output.push_str(&summary.top_3.to_string());
     output.push('\n');
-    output.push_str("Top-5   : ");
+    output.push_str("Search Top-5   : ");
     output.push_str(&summary.top_5.to_string());
     output.push('\n');
     output.push_str("Misses  : ");
@@ -243,17 +213,20 @@ fn format_report(reports: &[CaseReport], verbose: bool) -> String {
     output
 }
 
-fn format_expected_status(status: &ExpectedStatus) -> String {
+fn format_expected_status(status: &ExpectedStatus, position_label: &str) -> String {
     match status {
-        ExpectedStatus::Found { event, rank } => {
-            format!("found: {} rank {rank}", format_event_ref(event))
+        ExpectedStatus::Found { event, position } => {
+            format!(
+                "found: {} {position_label} {position}",
+                format_event_ref(event)
+            )
         }
         ExpectedStatus::BelowRank {
             event,
-            rank,
+            position,
             max_rank,
         } => format!(
-            "found below required rank: {} rank {rank}, required <= {max_rank}",
+            "found below required {position_label}: {} {position_label} {position}, required <= {max_rank}",
             format_event_ref(event)
         ),
         ExpectedStatus::Missing => "result: not found".to_string(),
@@ -312,6 +285,57 @@ fn append_verbose_result(output: &mut String, rank: usize, result: &SearchResult
     output.push('\n');
 }
 
+fn append_verbose_event(output: &mut String, position: usize, event: &Event) {
+    output.push_str("    Event ");
+    output.push_str(&position.to_string());
+    output.push('\n');
+    output.push_str("      source      : ");
+    output.push_str(event.source.as_str());
+    output.push('\n');
+    output.push_str("      id          : ");
+    output.push_str(event.id.as_str());
+    output.push('\n');
+    output.push_str("      timestamp   : ");
+    output.push_str(
+        event
+            .timestamp
+            .as_ref()
+            .map(Timestamp::as_str)
+            .unwrap_or("none"),
+    );
+    output.push('\n');
+    output.push_str("      title       : ");
+    output.push_str(&event.title);
+    output.push('\n');
+    output.push_str("      metadata    : ");
+    output.push_str(&format_metadata(&event.metadata));
+    output.push('\n');
+}
+
+fn append_verbose_evidence(output: &mut String, position: usize, evidence: &EvidenceBlock) {
+    output.push_str("    Evidence ");
+    output.push_str(&position.to_string());
+    output.push('\n');
+    output.push_str("      source      : ");
+    output.push_str(evidence.source.as_str());
+    output.push('\n');
+    output.push_str("      id          : ");
+    output.push_str(evidence.id.as_str());
+    output.push('\n');
+    output.push_str("      timestamp   : ");
+    output.push_str(
+        evidence
+            .timestamp
+            .as_ref()
+            .map(Timestamp::as_str)
+            .unwrap_or("none"),
+    );
+    output.push('\n');
+    output.push_str("      title       : ");
+    output.push_str(&evidence.title);
+    output.push('\n');
+}
+
 fn diagnostic_value<'a>(result: &'a SearchResult, key: &str) -> &'a str {
     result
         .diagnostics
@@ -324,39 +348,28 @@ fn format_event_ref(event: &EventRef) -> String {
     format!("{}:{}", event.source.as_str(), event.id.as_str())
 }
 
-fn normalize_ask_query(question: &str) -> String {
-    let mut normalized_query = String::new();
-    for character in question.chars() {
-        if character.is_alphanumeric() || character.is_whitespace() {
-            normalized_query.extend(character.to_lowercase());
-        } else {
-            normalized_query.push(' ');
+fn format_retrieval_plan(plan: &RetrievalPlan) -> String {
+    match plan {
+        RetrievalPlan::Search { query } => format!("search {query}"),
+        RetrievalPlan::ProjectLatest { query } => format!("project latest {query}"),
+        RetrievalPlan::Timeline { range, query } => {
+            if query.is_empty() {
+                format!("timeline {}", format_date_range(range))
+            } else {
+                format!("timeline {} {query}", format_date_range(range))
+            }
         }
     }
+}
 
-    let words = normalized_query.split_whitespace().collect::<Vec<_>>();
-    let normalized = words
-        .iter()
-        .copied()
-        .filter(|word| !ASK_STOP_WORDS.contains(word))
-        .collect::<Vec<_>>();
-    if !normalized.is_empty() {
-        return normalized.join(" ");
+fn format_date_range(range: &recall_core::DateRange) -> String {
+    match range {
+        recall_core::DateRange::Day(date) => date.to_string(),
+        recall_core::DateRange::Today => "today".to_string(),
+        recall_core::DateRange::Yesterday => "yesterday".to_string(),
+        recall_core::DateRange::LastWeek => "last week".to_string(),
+        recall_core::DateRange::LastDays(days) => format!("last {days} days"),
     }
-
-    let fallback = words
-        .iter()
-        .copied()
-        .filter(|word| !ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS.contains(word))
-        .collect::<Vec<_>>();
-    if !fallback.is_empty() {
-        return fallback.join(" ");
-    }
-
-    normalized_query
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn load_cases(json: &str) -> Result<Vec<EvalCase>, String> {
@@ -809,17 +822,62 @@ struct Expected {
 #[derive(Debug, Eq, PartialEq)]
 struct MatchedResult {
     event: EventRef,
-    rank: usize,
+    position: usize,
 }
 
 #[derive(Debug)]
 struct CaseReport {
     id: String,
     question: String,
-    query: String,
+    plan: String,
+    evaluation: EvaluationOutput,
+    retrieved_events: Vec<Event>,
+    evidence: Vec<EvidenceBlock>,
     expected: Vec<ExpectedReport>,
-    results: Vec<SearchResult>,
     passed: bool,
+}
+
+#[derive(Debug)]
+struct EvaluationOutput {
+    kind: EvaluationKind,
+    position_label: &'static str,
+    events: Vec<EventRef>,
+    search_results: Vec<SearchResult>,
+}
+
+impl EvaluationOutput {
+    fn from_plan(
+        plan: &RetrievalPlan,
+        search_results: &[SearchResult],
+        evidence: &[EvidenceBlock],
+    ) -> Self {
+        match plan {
+            RetrievalPlan::Search { .. } => Self {
+                kind: EvaluationKind::Search,
+                position_label: "rank",
+                events: search_results
+                    .iter()
+                    .map(|result| result.event.clone())
+                    .collect(),
+                search_results: search_results.to_vec(),
+            },
+            RetrievalPlan::ProjectLatest { .. } | RetrievalPlan::Timeline { .. } => Self {
+                kind: EvaluationKind::CompiledEvidence,
+                position_label: "evidence position",
+                events: evidence
+                    .iter()
+                    .map(|evidence| EventRef::new(evidence.source.clone(), evidence.id.clone()))
+                    .collect(),
+                search_results: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum EvaluationKind {
+    Search,
+    CompiledEvidence,
 }
 
 #[derive(Debug)]
@@ -833,11 +891,11 @@ struct ExpectedReport {
 enum ExpectedStatus {
     Found {
         event: EventRef,
-        rank: usize,
+        position: usize,
     },
     BelowRank {
         event: EventRef,
-        rank: usize,
+        position: usize,
         max_rank: usize,
     },
     Missing,
@@ -846,6 +904,8 @@ enum ExpectedStatus {
 #[derive(Debug)]
 struct Summary {
     queries: usize,
+    search_queries: usize,
+    evidence_queries: usize,
     top_1: usize,
     top_3: usize,
     top_5: usize,
@@ -857,35 +917,43 @@ impl Summary {
         let mut top_1 = 0;
         let mut top_3 = 0;
         let mut top_5 = 0;
+        let mut search_queries = 0;
+        let mut evidence_queries = 0;
         let mut misses = 0;
 
         for report in reports {
+            match report.evaluation.kind {
+                EvaluationKind::Search => search_queries += 1,
+                EvaluationKind::CompiledEvidence => evidence_queries += 1,
+            }
+
             let best_rank = report
                 .expected
                 .iter()
                 .filter_map(|expected| match expected.status {
-                    ExpectedStatus::Found { rank, .. } | ExpectedStatus::BelowRank { rank, .. } => {
-                        Some(rank)
-                    }
+                    ExpectedStatus::Found { position, .. }
+                    | ExpectedStatus::BelowRank { position, .. } => Some(position),
                     ExpectedStatus::Missing => None,
                 })
                 .min();
 
-            match best_rank {
-                Some(rank) if rank <= 1 => {
-                    top_1 += 1;
-                    top_3 += 1;
-                    top_5 += 1;
+            if matches!(report.evaluation.kind, EvaluationKind::Search) {
+                match best_rank {
+                    Some(rank) if rank <= 1 => {
+                        top_1 += 1;
+                        top_3 += 1;
+                        top_5 += 1;
+                    }
+                    Some(rank) if rank <= 3 => {
+                        top_3 += 1;
+                        top_5 += 1;
+                    }
+                    Some(rank) if rank <= 5 => {
+                        top_5 += 1;
+                    }
+                    Some(_) => {}
+                    None => {}
                 }
-                Some(rank) if rank <= 3 => {
-                    top_3 += 1;
-                    top_5 += 1;
-                }
-                Some(rank) if rank <= 5 => {
-                    top_5 += 1;
-                }
-                Some(_) => {}
-                None => {}
             }
 
             misses += report
@@ -897,6 +965,8 @@ impl Summary {
 
         Self {
             queries: reports.len(),
+            search_queries,
+            evidence_queries,
             top_1,
             top_3,
             top_5,
