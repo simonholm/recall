@@ -350,7 +350,16 @@ fn format_event_ref(event: &EventRef) -> String {
 
 fn format_retrieval_plan(plan: &RetrievalPlan) -> String {
     match plan {
-        RetrievalPlan::Search { query } => format!("search {query}"),
+        RetrievalPlan::Search { query } => {
+            let mut formatted = format!("search {}", query.subject());
+            if query.intent() != recall_core::SearchIntent::Plain {
+                formatted.push_str(&format!(" intent:{}", query.intent().as_str()));
+            }
+            if !query.intent_terms().is_empty() {
+                formatted.push_str(&format!(" intent_terms:{}", query.intent_terms().join(" ")));
+            }
+            formatted
+        }
         RetrievalPlan::ProjectLatest { query } => format!("project latest {query}"),
         RetrievalPlan::Timeline { range, query } => {
             if query.is_empty() {

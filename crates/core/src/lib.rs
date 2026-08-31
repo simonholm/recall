@@ -191,12 +191,71 @@ impl Timeline {
 /// High-level retrieval strategy selected for an ask question.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetrievalPlan {
-    /// Use source-local lexical search with the normalized query.
-    Search { query: String },
+    /// Use source-local lexical search with the normalized subject query.
+    Search { query: SearchQuery },
     /// Use newest project-owned events for resume/latest-state questions.
     ProjectLatest { query: String },
     /// Use timeline retrieval for a relative date range, optionally narrowed by explicit subject terms.
     Timeline { range: DateRange, query: String },
+}
+
+/// Structured lexical search query for ask retrieval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchQuery {
+    subject: String,
+    intent: SearchIntent,
+    intent_terms: Vec<String>,
+}
+
+impl SearchQuery {
+    /// Creates a plain lexical search query.
+    pub fn plain(query: impl Into<String>) -> Self {
+        Self {
+            subject: query.into(),
+            intent: SearchIntent::Plain,
+            intent_terms: Vec::new(),
+        }
+    }
+
+    /// Returns the subject terms used for lexical retrieval.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Returns the evidence intent inferred from the question.
+    pub fn intent(&self) -> SearchIntent {
+        self.intent
+    }
+
+    /// Returns the terms that expressed the inferred evidence intent.
+    pub fn intent_terms(&self) -> &[String] {
+        &self.intent_terms
+    }
+}
+
+/// Evidence intent inferred for an ask Search query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchIntent {
+    /// No specific evidence intent was identified.
+    Plain,
+    /// The question asks for rationale or motivation.
+    Rationale,
+    /// The question asks whether something was discussed.
+    Discussion,
+    /// The question asks for completed or landed change evidence.
+    CompletedChange,
+}
+
+impl SearchIntent {
+    /// Returns a stable diagnostic label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Rationale => "rationale",
+            Self::Discussion => "discussion",
+            Self::CompletedChange => "completed-change",
+        }
+    }
 }
 
 /// Date range extracted from a question.
@@ -309,7 +368,7 @@ impl RetrievalPlanner {
         }
 
         RetrievalPlan::Search {
-            query: normalize_ask_query_words(&normalized_words),
+            query: search_query_from_words(&normalized_words),
         }
     }
 }
@@ -1863,6 +1922,74 @@ fn normalize_ask_query_words(words: &[String]) -> String {
         .join(" ")
 }
 
+fn search_query_from_words(words: &[String]) -> SearchQuery {
+    let intent = search_intent(words);
+    if intent == SearchIntent::Plain {
+        return SearchQuery::plain(normalize_ask_query_words(words));
+    }
+
+    let intent_terms = search_intent_terms(words, intent);
+    let intent_term_refs = intent_terms.iter().map(String::as_str).collect::<Vec<_>>();
+    let subject_terms = words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !ASK_STOP_WORDS.contains(word) && !intent_term_refs.contains(word))
+        .collect::<Vec<_>>();
+
+    let subject = if subject_terms.is_empty() {
+        normalize_ask_query_words(words)
+    } else {
+        subject_terms.join(" ")
+    };
+
+    SearchQuery {
+        subject,
+        intent,
+        intent_terms,
+    }
+}
+
+fn search_intent(words: &[String]) -> SearchIntent {
+    if contains_word(words, "why") {
+        return SearchIntent::Rationale;
+    }
+    if contains_word_sequence(words, &["did", "i", "discuss"])
+        || contains_word_sequence(words, &["what", "did", "i", "discuss"])
+        || contains_word_sequence(words, &["what", "we", "discussed"])
+    {
+        return SearchIntent::Discussion;
+    }
+    if contains_word(words, "landed")
+        || contains_word_sequence(words, &["when", "did", "i", "implement"])
+    {
+        return SearchIntent::CompletedChange;
+    }
+
+    SearchIntent::Plain
+}
+
+fn search_intent_terms(words: &[String], intent: SearchIntent) -> Vec<String> {
+    words
+        .iter()
+        .filter(|word| match intent {
+            SearchIntent::Plain => false,
+            SearchIntent::Rationale => {
+                word.as_str() == "why"
+                    || (word.as_str() == "introduce"
+                        && contains_word_sequence(words, &["why", "did", "i", "introduce"]))
+            }
+            SearchIntent::Discussion => {
+                matches!(word.as_str(), "about" | "discuss" | "discussed")
+            }
+            SearchIntent::CompletedChange if contains_word(words, "landed") => {
+                matches!(word.as_str(), "actually" | "change" | "landed")
+            }
+            SearchIntent::CompletedChange => word.as_str() == "implement",
+        })
+        .cloned()
+        .collect()
+}
+
 fn normalize_project_latest_query_words(words: &[String]) -> String {
     let normalized = words
         .iter()
@@ -2230,11 +2357,12 @@ impl Recall {
     ) -> AdapterResult<AskRetrieval> {
         match plan {
             RetrievalPlan::Search { query } => {
-                let search_matches = self
-                    .search_events(query)?
+                let mut search_matches = self
+                    .search_events(query.subject())?
                     .into_iter()
                     .take(ASK_RESULT_LIMIT)
-                    .collect();
+                    .collect::<Vec<_>>();
+                annotate_search_matches(query, &mut search_matches);
                 let (search_results, events) = split_search_matches(search_matches);
                 Ok(AskRetrieval {
                     events,
@@ -2278,6 +2406,35 @@ fn split_search_matches(search_matches: Vec<SearchMatch>) -> (Vec<SearchResult>,
         .into_iter()
         .map(|search_match| (search_match.result, search_match.event))
         .unzip()
+}
+
+fn annotate_search_matches(query: &SearchQuery, matches: &mut [SearchMatch]) {
+    for search_match in matches {
+        annotate_search_result(query, &mut search_match.result);
+    }
+}
+
+/// Adds ask Search query diagnostics to search results.
+pub fn annotate_search_results(query: &SearchQuery, results: &mut [SearchResult]) {
+    for result in results {
+        annotate_search_result(query, result);
+    }
+}
+
+fn annotate_search_result(query: &SearchQuery, result: &mut SearchResult) {
+    result
+        .diagnostics
+        .insert("search_subject".to_string(), query.subject().to_string());
+    result.diagnostics.insert(
+        "search_intent".to_string(),
+        query.intent().as_str().to_string(),
+    );
+    if !query.intent_terms().is_empty() {
+        result.diagnostics.insert(
+            "search_intent_terms".to_string(),
+            query.intent_terms().join(" "),
+        );
+    }
 }
 
 fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
@@ -2675,7 +2832,89 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Search {
-                query: "introduce eventref".to_string()
+                query: SearchQuery {
+                    subject: "eventref".to_string(),
+                    intent: SearchIntent::Rationale,
+                    intent_terms: vec!["why".to_string(), "introduce".to_string()]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_splits_completed_change_search_subject_and_intent() {
+        let plan = RetrievalPlanner::new().plan("What EventRef change actually landed?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "eventref".to_string(),
+                    intent: SearchIntent::CompletedChange,
+                    intent_terms: vec![
+                        "change".to_string(),
+                        "actually".to_string(),
+                        "landed".to_string()
+                    ]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_splits_discussion_search_subject_and_intent() {
+        let plan = RetrievalPlanner::new().plan("Did I discuss EventRef?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "eventref".to_string(),
+                    intent: SearchIntent::Discussion,
+                    intent_terms: vec!["discuss".to_string()]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_keeps_intent_like_words_when_they_are_subject_terms() {
+        for (question, query) in [
+            (
+                "Why did the introduce command fail?",
+                SearchQuery {
+                    subject: "introduce command fail".to_string(),
+                    intent: SearchIntent::Rationale,
+                    intent_terms: vec!["why".to_string()],
+                },
+            ),
+            (
+                "What is the discussion parser?",
+                SearchQuery::plain("discussion parser"),
+            ),
+            (
+                "What changed in the change detector?",
+                SearchQuery::plain("changed change detector"),
+            ),
+        ] {
+            let plan = RetrievalPlanner::new().plan(question);
+
+            assert_eq!(plan, RetrievalPlan::Search { query }, "{question}");
+        }
+    }
+
+    #[test]
+    fn retrieval_planner_preserves_implemented_search_subject() {
+        let plan = RetrievalPlanner::new().plan("When did I implement the Git adapter?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "git adapter".to_string(),
+                    intent: SearchIntent::CompletedChange,
+                    intent_terms: vec!["implement".to_string()]
+                }
             }
         );
     }
@@ -2723,7 +2962,7 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Search {
-                query: "disk agent".to_string()
+                query: SearchQuery::plain("disk agent")
             }
         );
     }
@@ -3766,9 +4005,9 @@ mod tests {
         let RetrievalPlan::Search { query } = plan else {
             panic!("expected search plan");
         };
-        let results = recall.search_events(&query).unwrap();
+        let results = recall.search_events(query.subject()).unwrap();
 
-        assert_eq!(query, "disk agent");
+        assert_eq!(query.subject(), "disk agent");
         assert_eq!(results[0].event.id.as_str(), "disk-agent");
         assert_eq!(
             results[0]
@@ -3779,6 +4018,57 @@ mod tests {
             Some("1000")
         );
         assert_eq!(results[1].event.id.as_str(), "misleading-recall");
+    }
+
+    #[test]
+    fn recall_ask_search_uses_subject_query_and_preserves_intent_diagnostics() {
+        let mut recall = Recall::new();
+        recall.register(StaticAdapter::new(
+            Source::Git,
+            "eventref",
+            "Refine EventRef core model",
+        ));
+
+        let plan = RetrievalPlanner::new().plan("What EventRef change actually landed?");
+        let retrieval = recall.ask_retrieval(&plan).unwrap();
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "eventref".to_string(),
+                    intent: SearchIntent::CompletedChange,
+                    intent_terms: vec![
+                        "change".to_string(),
+                        "actually".to_string(),
+                        "landed".to_string()
+                    ]
+                }
+            }
+        );
+        assert_eq!(retrieval.search_results.len(), 1);
+        assert_eq!(retrieval.search_results[0].snippet, "eventref");
+        assert_eq!(
+            retrieval.search_results[0]
+                .diagnostics
+                .get("search_subject")
+                .map(String::as_str),
+            Some("eventref")
+        );
+        assert_eq!(
+            retrieval.search_results[0]
+                .diagnostics
+                .get("search_intent")
+                .map(String::as_str),
+            Some("completed-change")
+        );
+        assert_eq!(
+            retrieval.search_results[0]
+                .diagnostics
+                .get("search_intent_terms")
+                .map(String::as_str),
+            Some("change actually landed")
+        );
     }
 
     #[test]

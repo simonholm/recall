@@ -246,7 +246,9 @@ fn diagnostic_events_as_of(
     as_of: &DateTime<FixedOffset>,
 ) -> Result<Vec<Event>, String> {
     match plan {
-        RetrievalPlan::Search { query } => diagnostic_search_events_as_of(recall, query, as_of),
+        RetrievalPlan::Search { query } => {
+            diagnostic_search_events_as_of(recall, query.subject(), as_of)
+        }
         RetrievalPlan::ProjectLatest { query } => {
             let events = recall
                 .timeline()

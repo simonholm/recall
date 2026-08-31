@@ -16,10 +16,10 @@ use recall_codex::CodexAdapter;
 #[cfg(test)]
 use recall_core::ContextCompiler;
 use recall_core::{
-    compile_ask_evidence, project_metadata_matches_query_text, AdapterCallTiming, DateRange, Event,
-    EventId, EventRef, EvidenceBlock, PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner,
-    SearchDiagnostics, SearchMatch, SearchResult, Source, Timeline, TimelineDiagnostics,
-    ASK_RESULT_LIMIT,
+    annotate_search_results, compile_ask_evidence, project_metadata_matches_query_text,
+    AdapterCallTiming, DateRange, Event, EventId, EventRef, EvidenceBlock, PromptBuilder, Recall,
+    RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch, SearchQuery, SearchResult,
+    Source, Timeline, TimelineDiagnostics, ASK_RESULT_LIMIT,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -960,7 +960,7 @@ fn ask_retrieval_with_timings(
     match plan {
         RetrievalPlan::Search { query } => {
             let search = recall
-                .search_with_diagnostics(query)
+                .search_with_diagnostics(query.subject())
                 .map_err(|error| error.to_string())?;
             let SearchDiagnostics {
                 adapter_searches,
@@ -975,6 +975,8 @@ fn ask_retrieval_with_timings(
 
             let returned_results = search_matches.len();
             let (search_results, events) = split_search_matches(search_matches);
+            let mut search_results = search_results;
+            annotate_search_results(query, &mut search_results);
             let inspect_total_ms = 0;
             let total_ms = elapsed_ms(total_started);
 
@@ -1173,7 +1175,7 @@ fn normalized_query_terms(text: &str) -> Vec<String> {
 #[cfg(test)]
 fn normalize_ask_query(question: &str) -> String {
     match RetrievalPlanner::new().plan(question) {
-        RetrievalPlan::Search { query } => query,
+        RetrievalPlan::Search { query } => query.subject().to_string(),
         RetrievalPlan::ProjectLatest { query } => query,
         RetrievalPlan::Timeline { range, query } => {
             format_timeline_query(&range, &query).unwrap_or_else(|| format_date_range(&range))
@@ -1183,12 +1185,28 @@ fn normalize_ask_query(question: &str) -> String {
 
 fn format_retrieval_plan(plan: &RetrievalPlan) -> String {
     match plan {
-        RetrievalPlan::Search { query } => query.clone(),
+        RetrievalPlan::Search { query } => format_search_query(query),
         RetrievalPlan::ProjectLatest { query } => format!("project latest {query}"),
         RetrievalPlan::Timeline { range, query } => format_timeline_query(range, query)
             .map(|query| format!("timeline {query}"))
             .unwrap_or_else(|| format!("timeline {}", format_date_range(range))),
     }
+}
+
+fn format_search_query(query: &SearchQuery) -> String {
+    let mut formatted = query.subject().to_string();
+    if query.intent() != recall_core::SearchIntent::Plain {
+        write!(formatted, " intent:{}", query.intent().as_str()).unwrap();
+    }
+    if !query.intent_terms().is_empty() {
+        write!(
+            formatted,
+            " intent_terms:{}",
+            query.intent_terms().join(" ")
+        )
+        .unwrap();
+    }
+    formatted
 }
 
 fn format_timeline_query(range: &DateRange, query: &str) -> Option<String> {
@@ -1571,7 +1589,7 @@ mod tests {
     fn normalize_ask_query_removes_question_words_and_punctuation() {
         assert_eq!(
             normalize_ask_query("When did I implement timeline?"),
-            "implement timeline"
+            "timeline"
         );
     }
 
@@ -1596,7 +1614,7 @@ mod tests {
     fn normalize_ask_query_preserves_technical_terms_as_lowercase_words() {
         assert_eq!(
             normalize_ask_query("Why did I introduce EventRef?"),
-            "introduce eventref"
+            "eventref"
         );
         assert_eq!(
             normalize_ask_query("What evidence shows that I actually completed disk-guard today?"),
@@ -1950,7 +1968,7 @@ mod tests {
             .insert("cwd".to_string(), "/repo/recall".to_string());
         second.description = "Next step: keep ProjectState for search.".to_string();
         let plan = RetrievalPlan::Search {
-            query: "compiler".to_string(),
+            query: SearchQuery::plain("compiler"),
         };
 
         let evidence = compile_evidence(&plan, "What changed?", &[first, second]);
@@ -2426,7 +2444,7 @@ mod tests {
         let output = format_debug_query(
             "When did I ask?",
             &RetrievalPlan::Search {
-                query: "ask".to_string(),
+                query: SearchQuery::plain("ask"),
             },
         );
 
@@ -2507,7 +2525,7 @@ mod tests {
             },
             "What happened?",
             &RetrievalPlan::Search {
-                query: "happened".to_string(),
+                query: SearchQuery::plain("happened"),
             },
             &[],
             &[],
