@@ -266,7 +266,7 @@ fn diagnostic_events_as_of(
                 .collect();
             Ok(events)
         }
-        RetrievalPlan::Timeline { range } => {
+        RetrievalPlan::Timeline { range, query } => {
             let events = recall
                 .timeline()
                 .map_err(|error| error.to_string())?
@@ -277,7 +277,8 @@ fn diagnostic_events_as_of(
                         range.contains_timestamp(timestamp)
                             && timestamp_is_at_or_before(timestamp, as_of)
                     })
-                });
+                })
+                .filter(|event| super::event_matches_query(event, query));
 
             match range {
                 recall_core::DateRange::Day(_) => Ok(events.collect()),

@@ -906,8 +906,8 @@ fn ask_retrieval(recall: &Recall, plan: &RetrievalPlan) -> Result<AskRetrieval, 
             events: ask_project_latest_events(recall, query)?,
             search_results: Vec::new(),
         }),
-        RetrievalPlan::Timeline { range } => Ok(AskRetrieval {
-            events: ask_timeline_events(recall, range)?,
+        RetrievalPlan::Timeline { range, query } => Ok(AskRetrieval {
+            events: ask_timeline_events(recall, range, query)?,
             search_results: Vec::new(),
         }),
     }
@@ -998,7 +998,7 @@ fn ask_retrieval_with_timings(
                 },
             })
         }
-        RetrievalPlan::Timeline { range } => {
+        RetrievalPlan::Timeline { range, query } => {
             let timeline = recall
                 .timeline_with_diagnostics()
                 .map_err(|error| error.to_string())?;
@@ -1019,6 +1019,7 @@ fn ask_retrieval_with_timings(
                         .as_ref()
                         .is_some_and(|timestamp| range.contains_timestamp(timestamp))
                 })
+                .filter(|event| event_matches_query(event, query))
                 .collect();
             let events = match range {
                 DateRange::Day(_) => events,
@@ -1082,7 +1083,11 @@ fn project_latest_events(events: Vec<Event>, query: &str) -> Vec<Event> {
         .collect()
 }
 
-fn ask_timeline_events(recall: &Recall, range: &DateRange) -> Result<Vec<Event>, String> {
+fn ask_timeline_events(
+    recall: &Recall,
+    range: &DateRange,
+    query: &str,
+) -> Result<Vec<Event>, String> {
     let events: Vec<_> = recall
         .timeline()
         .map_err(|error| error.to_string())?
@@ -1094,6 +1099,7 @@ fn ask_timeline_events(recall: &Recall, range: &DateRange) -> Result<Vec<Event>,
                 .as_ref()
                 .is_some_and(|timestamp| range.contains_timestamp(timestamp))
         })
+        .filter(|event| event_matches_query(event, query))
         .collect();
 
     match range {
@@ -1102,12 +1108,52 @@ fn ask_timeline_events(recall: &Recall, range: &DateRange) -> Result<Vec<Event>,
     }
 }
 
+fn event_matches_query(event: &Event, query: &str) -> bool {
+    let query_terms = normalized_query_terms(query);
+    if query_terms.is_empty() {
+        return true;
+    }
+
+    let mut haystack = String::new();
+    haystack.push_str(&event.title);
+    haystack.push(' ');
+    haystack.push_str(&event.description);
+    for (key, value) in &event.metadata {
+        haystack.push(' ');
+        haystack.push_str(key);
+        haystack.push(' ');
+        haystack.push_str(value);
+    }
+    let haystack_terms = normalized_query_terms(&haystack);
+
+    query_terms.iter().all(|term| {
+        haystack_terms
+            .iter()
+            .any(|haystack_term| haystack_term == term)
+    })
+}
+
+fn normalized_query_terms(text: &str) -> Vec<String> {
+    let mut normalized = String::new();
+    for character in text.chars() {
+        if character.is_alphanumeric() || character.is_whitespace() {
+            normalized.extend(character.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+
+    normalized.split_whitespace().map(str::to_string).collect()
+}
+
 #[cfg(test)]
 fn normalize_ask_query(question: &str) -> String {
     match RetrievalPlanner::new().plan(question) {
         RetrievalPlan::Search { query } => query,
         RetrievalPlan::ProjectLatest { query } => query,
-        RetrievalPlan::Timeline { range } => format_date_range(&range),
+        RetrievalPlan::Timeline { range, query } => {
+            format_timeline_query(&range, &query).unwrap_or_else(|| format_date_range(&range))
+        }
     }
 }
 
@@ -1115,7 +1161,17 @@ fn format_retrieval_plan(plan: &RetrievalPlan) -> String {
     match plan {
         RetrievalPlan::Search { query } => query.clone(),
         RetrievalPlan::ProjectLatest { query } => format!("project latest {query}"),
-        RetrievalPlan::Timeline { range } => format!("timeline {}", format_date_range(range)),
+        RetrievalPlan::Timeline { range, query } => format_timeline_query(range, query)
+            .map(|query| format!("timeline {query}"))
+            .unwrap_or_else(|| format!("timeline {}", format_date_range(range))),
+    }
+}
+
+fn format_timeline_query(range: &DateRange, query: &str) -> Option<String> {
+    if query.is_empty() {
+        None
+    } else {
+        Some(format!("{} {query}", format_date_range(range)))
     }
 }
 
@@ -1517,6 +1573,10 @@ mod tests {
             normalize_ask_query("Why did I introduce EventRef?"),
             "introduce eventref"
         );
+        assert_eq!(
+            normalize_ask_query("What evidence shows that I actually completed disk-guard today?"),
+            "today disk guard"
+        );
     }
 
     #[test]
@@ -1535,7 +1595,7 @@ mod tests {
         );
         assert_eq!(
             normalize_ask_query("Summarize today's recall work."),
-            "today"
+            "today recall"
         );
     }
 
@@ -1591,10 +1651,36 @@ mod tests {
         excluded.timestamp = Some(Timestamp::new("1900-01-01T12:00:00Z"));
         recall.register(TestAdapter::new(vec![included, excluded]));
 
-        let events = ask_timeline_events(&recall, &DateRange::LastDays(30_000)).unwrap();
+        let events = ask_timeline_events(&recall, &DateRange::LastDays(30_000), "").unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id.as_str(), "included");
+    }
+
+    #[test]
+    fn ask_timeline_events_filters_by_explicit_subject_terms() {
+        let mut recall = Recall::new();
+        let mut disk_guard = Event::new(
+            "disk-guard",
+            Source::Other("test".to_string()),
+            "Completed disk-guard",
+        );
+        disk_guard.timestamp = Some(Timestamp::new("2026-08-30T12:00:00Z"));
+        disk_guard.description = "Finished the disk-guard release checks.".to_string();
+        let mut unrelated = Event::new(
+            "unrelated",
+            Source::Other("test".to_string()),
+            "Completed unrelated work",
+        );
+        unrelated.timestamp = Some(Timestamp::new("2026-08-30T13:00:00Z"));
+        unrelated.description = "Finished a different task today.".to_string();
+        recall.register(TestAdapter::new(vec![disk_guard, unrelated]));
+
+        let events =
+            ask_timeline_events(&recall, &DateRange::LastDays(30_000), "disk guard").unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id.as_str(), "disk-guard");
     }
 
     #[test]
@@ -1674,8 +1760,11 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, source)| {
-                let mut event =
-                    Event::new(format!("event-{index}"), source, format!("Event {index}"));
+                let mut event = Event::new(
+                    format!("event-{index}"),
+                    source,
+                    format!("Recall event {index}"),
+                );
                 event.timestamp = Some(Timestamp::new(format!(
                     "2026-08-05T12:{:02}:00Z",
                     59 - index
@@ -1686,10 +1775,10 @@ mod tests {
         recall.register(TestAdapter::new(events));
 
         let plan = RetrievalPlanner::new().plan("What did I work on in Recall on August 5, 2026?");
-        let RetrievalPlan::Timeline { range } = plan else {
+        let RetrievalPlan::Timeline { range, query } = plan else {
             panic!("expected explicit date to use timeline retrieval");
         };
-        let events = ask_timeline_events(&recall, &range).unwrap();
+        let events = ask_timeline_events(&recall, &range, &query).unwrap();
 
         assert_eq!(events.len(), 10);
         assert_eq!(events[8].source, Source::Git);
@@ -1714,6 +1803,7 @@ mod tests {
         second.description = "Implemented GitHub Pages preparation.".to_string();
         let plan = RetrievalPlan::Timeline {
             range: DateRange::Day(chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap()),
+            query: String::new(),
         };
         let events = vec![first, second];
 
@@ -2270,6 +2360,7 @@ mod tests {
         let output = format_debug_retrieval(
             &RetrievalPlan::Timeline {
                 range: DateRange::Yesterday,
+                query: String::new(),
             },
             &[],
             &[event],
@@ -2286,6 +2377,7 @@ mod tests {
         let output = format_debug_retrieval(
             &RetrievalPlan::Timeline {
                 range: DateRange::Yesterday,
+                query: String::new(),
             },
             &[],
             &[],

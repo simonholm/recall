@@ -195,8 +195,8 @@ pub enum RetrievalPlan {
     Search { query: String },
     /// Use newest project-owned events for resume/latest-state questions.
     ProjectLatest { query: String },
-    /// Use timeline retrieval for a relative date range.
-    Timeline { range: DateRange },
+    /// Use timeline retrieval for a relative date range, optionally narrowed by explicit subject terms.
+    Timeline { range: DateRange, query: String },
 }
 
 /// Date range extracted from a question.
@@ -256,6 +256,7 @@ impl RetrievalPlanner {
         if let Some(date) = explicit_date(question) {
             return RetrievalPlan::Timeline {
                 range: DateRange::Day(date),
+                query: normalize_temporal_subject_query_words(&normalize_question_words(question)),
             };
         }
 
@@ -263,6 +264,7 @@ impl RetrievalPlanner {
         if contains_word(&normalized_words, "today") || contains_word(&normalized_words, "todays") {
             return RetrievalPlan::Timeline {
                 range: DateRange::Today,
+                query: normalize_temporal_subject_query_words(&normalized_words),
             };
         }
         if contains_word(&normalized_words, "yesterday")
@@ -270,6 +272,7 @@ impl RetrievalPlanner {
         {
             return RetrievalPlan::Timeline {
                 range: DateRange::Yesterday,
+                query: normalize_temporal_subject_query_words(&normalized_words),
             };
         }
         if contains_word(&normalized_words, "recently")
@@ -277,16 +280,19 @@ impl RetrievalPlanner {
         {
             return RetrievalPlan::Timeline {
                 range: DateRange::LastDays(7),
+                query: normalize_temporal_subject_query_words(&normalized_words),
             };
         }
         if contains_word_sequence(&normalized_words, &["last", "week"]) {
             return RetrievalPlan::Timeline {
                 range: DateRange::LastWeek,
+                query: normalize_temporal_subject_query_words(&normalized_words),
             };
         }
         if let Some(days) = last_days_range(&normalized_words) {
             return RetrievalPlan::Timeline {
                 range: DateRange::LastDays(days),
+                query: normalize_temporal_subject_query_words(&normalized_words),
             };
         }
 
@@ -1760,6 +1766,46 @@ const ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS: &[&str] = &[
     "today",
     "todays",
 ];
+const TEMPORAL_SUBJECT_STOP_WORDS: &[&str] = &[
+    "evidence",
+    "show",
+    "shows",
+    "shown",
+    "actually",
+    "that",
+    "s",
+    "completed",
+    "complete",
+    "finished",
+    "finish",
+    "implemented",
+    "implement",
+    "work",
+    "works",
+    "working",
+    "accomplish",
+    "accomplished",
+    "changed",
+    "happened",
+    "recent",
+    "recently",
+    "last",
+    "days",
+    "day",
+    "week",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
 
 fn normalize_question_words(question: &str) -> Vec<String> {
     let mut normalized = String::new();
@@ -1813,6 +1859,14 @@ fn normalize_project_latest_query_words(words: &[String]) -> String {
     }
 
     normalize_ask_query_words(words)
+}
+
+fn normalize_temporal_subject_query_words(words: &[String]) -> String {
+    normalize_ask_query_words(words)
+        .split_whitespace()
+        .filter(|word| !TEMPORAL_SUBJECT_STOP_WORDS.contains(word) && word.parse::<u32>().is_err())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn contains_word(words: &[String], needle: &str) -> bool {
@@ -2528,7 +2582,48 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Timeline {
-                range: DateRange::Today
+                range: DateRange::Today,
+                query: "recall".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_preserves_subject_terms_for_today_evidence_questions() {
+        let plan = RetrievalPlanner::new()
+            .plan("What evidence shows that I actually completed disk-guard today?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Timeline {
+                range: DateRange::Today,
+                query: "disk guard".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_keeps_generic_today_questions_broad() {
+        let plan = RetrievalPlanner::new().plan("What did I accomplish today?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Timeline {
+                range: DateRange::Today,
+                query: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn retrieval_planner_preserves_other_named_entities_for_today_questions() {
+        let plan = RetrievalPlanner::new().plan("Did I finish recall-indexer today?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Timeline {
+                range: DateRange::Today,
+                query: "recall indexer".to_string()
             }
         );
     }
@@ -2540,7 +2635,8 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Timeline {
-                range: DateRange::LastDays(3)
+                range: DateRange::LastDays(3),
+                query: String::new()
             }
         );
     }
@@ -2552,7 +2648,8 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Timeline {
-                range: DateRange::LastWeek
+                range: DateRange::LastWeek,
+                query: String::new()
             }
         );
     }
@@ -2564,7 +2661,8 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Timeline {
-                range: DateRange::Day(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap())
+                range: DateRange::Day(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap()),
+                query: "recall".to_string()
             }
         );
     }
@@ -2576,7 +2674,8 @@ mod tests {
         assert_eq!(
             plan,
             RetrievalPlan::Timeline {
-                range: DateRange::Day(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap())
+                range: DateRange::Day(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap()),
+                query: "recall".to_string()
             }
         );
     }
