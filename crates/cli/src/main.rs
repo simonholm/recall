@@ -20,10 +20,10 @@ use recall_core::{
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, Write as IoWrite};
-use std::path::Path;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Instant;
 
 const ASK_RESULT_LIMIT: usize = 8;
@@ -120,8 +120,64 @@ fn default_recall() -> Recall {
     let mut recall = Recall::new();
     recall.register(CodexAdapter::new());
     recall.register(ClaudeAdapter::new());
-    recall.register(GitAdapter::new());
+    recall.register(default_git_adapter());
     recall
+}
+
+fn default_git_adapter() -> GitAdapter {
+    let repo_dirs = git_repository_dirs_for_current_working_dir();
+    if repo_dirs.is_empty() {
+        GitAdapter::new()
+    } else {
+        GitAdapter::with_repo_dirs(repo_dirs)
+    }
+}
+
+fn git_repository_dirs_for_current_working_dir() -> Vec<PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .map(|current_dir| git_repository_dirs_for_current_dir(&current_dir))
+        .unwrap_or_default()
+}
+
+fn git_repository_dirs_for_current_dir(current_dir: &Path) -> Vec<PathBuf> {
+    let Some(root) = git_repository_root(current_dir) else {
+        return Vec::new();
+    };
+    let Some(parent) = root.parent() else {
+        return vec![root];
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return vec![root];
+    };
+
+    let mut repo_dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(".git").exists())
+        .collect::<Vec<_>>();
+    repo_dirs.sort();
+    repo_dirs.dedup();
+
+    if repo_dirs.is_empty() {
+        vec![root]
+    } else {
+        repo_dirs
+    }
+}
+
+fn git_repository_root(current_dir: &Path) -> Option<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(current_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
 fn run(cli: Cli, recall: &Recall) -> Result<(), String> {
@@ -1328,6 +1384,7 @@ fn format_event(event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
     use clap::CommandFactory;
     use recall_core::{Adapter, AdapterResult, Metadata, Timestamp};
     use std::cell::Cell;
@@ -1788,6 +1845,70 @@ mod tests {
     }
 
     #[test]
+    fn default_git_discovery_is_stable_across_sibling_repository_cwds() {
+        let parent = temp_log_dir("git-discovery");
+        let recall_repo = parent.join("recall");
+        let reel_repo = parent.join("reel2ocr");
+        init_git_repo(&recall_repo);
+        init_git_repo(&reel_repo);
+
+        let from_recall = git_repository_dirs_for_current_dir(&recall_repo);
+        let from_reel = git_repository_dirs_for_current_dir(&reel_repo);
+
+        assert_eq!(from_recall, from_reel);
+        assert_eq!(from_recall, vec![recall_repo, reel_repo]);
+    }
+
+    #[test]
+    fn broad_timeline_ask_keeps_git_evidence_across_sibling_repository_cwds() {
+        let parent = temp_log_dir("git-timeline");
+        let recall_repo = parent.join("recall");
+        let reel_repo = parent.join("reel2ocr");
+        init_git_repo(&recall_repo);
+        init_git_repo(&reel_repo);
+        let git_sha = commit_git_repo(
+            &recall_repo,
+            "fix.txt",
+            "fix",
+            "fix: preserve temporal subject terms",
+            "Validated broad temporal Recall retrieval.",
+            "2026-08-31T09:00:00Z",
+        );
+        commit_git_repo(
+            &reel_repo,
+            "ocr.txt",
+            "ocr",
+            "docs: update OCR notes",
+            "",
+            "2026-08-30T09:00:00Z",
+        );
+
+        let mut codex_event = Event::new(
+            "01a0565a-544b-71d0-9f98-8e8ed322d2b7",
+            Source::Codex,
+            "Finish the current Recall work.",
+        );
+        codex_event.timestamp = Some(Timestamp::new("2026-08-31T10:00:00Z"));
+
+        let recall_from_recall =
+            broad_timeline_recall(&recall_repo, TestAdapter::new(vec![codex_event.clone()]));
+        let recall_from_reel =
+            broad_timeline_recall(&reel_repo, TestAdapter::new(vec![codex_event]));
+        let range = DateRange::Day(NaiveDate::from_ymd_opt(2026, 8, 31).unwrap());
+
+        let from_recall = ask_timeline_events(&recall_from_recall, &range, "").unwrap();
+        let from_reel = ask_timeline_events(&recall_from_reel, &range, "").unwrap();
+
+        for events in [&from_recall, &from_reel] {
+            assert!(events
+                .iter()
+                .any(|event| event.source == Source::Git && event.id.as_str() == git_sha));
+            assert!(events.iter().any(|event| event.source == Source::Codex
+                && event.id.as_str() == "01a0565a-544b-71d0-9f98-8e8ed322d2b7"));
+        }
+    }
+
+    #[test]
     fn timeline_evidence_keeps_same_project_codex_sessions_distinct() {
         let mut first = Event::new("session-1", Source::Codex, "Add WebMCP experiment");
         first.timestamp = Some(Timestamp::new("2026-08-26T12:34:39Z"));
@@ -1825,6 +1946,27 @@ mod tests {
         assert!(prompt.contains("Id: session-2"));
         assert!(displayed.contains("- codex:session-1 Add WebMCP experiment"));
         assert!(displayed.contains("- codex:session-2 Prepare WebMCP for Pages"));
+    }
+
+    #[test]
+    fn answer_output_evidence_lines_match_prompt_evidence_blocks() {
+        let block = EvidenceBlock {
+            source: Source::Codex,
+            id: EventId::new("session-1"),
+            timestamp: Some(Timestamp::new("2026-08-31T10:00:00Z")),
+            title: "Finish the current Recall work.".to_string(),
+            body: "Implemented disk-guard retrieval notes.\nPrompt-only temporal guidance."
+                .to_string(),
+        };
+
+        let displayed = format_answer_output("timeline today", &[block.clone()], "answer");
+        let prompt = PromptBuilder::new().build("What did I do today?", &[block]);
+
+        assert!(displayed.contains("- codex:session-1 Finish the current Recall work."));
+        assert!(prompt.contains("Id: session-1"));
+        assert!(prompt.contains("Implemented disk-guard retrieval notes."));
+        assert!(prompt.contains("Prompt-only temporal guidance."));
+        assert!(!displayed.contains("disk-guard"));
     }
 
     #[test]
@@ -2468,6 +2610,79 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("recall-cli-audit-{name}-{unique}"))
+    }
+
+    fn broad_timeline_recall(git_cwd: &Path, codex_adapter: TestAdapter) -> Recall {
+        let mut recall = Recall::new();
+        recall.register(codex_adapter);
+        recall.register(GitAdapter::with_repo_dirs(
+            git_repository_dirs_for_current_dir(git_cwd),
+        ));
+        recall
+    }
+
+    fn init_git_repo(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        run_git(repo, ["init"]);
+        run_git(repo, ["config", "user.name", "Recall Tests"]);
+        run_git(repo, ["config", "user.email", "recall@example.test"]);
+    }
+
+    fn commit_git_repo(
+        repo: &Path,
+        file: &str,
+        contents: &str,
+        subject: &str,
+        body: &str,
+        date: &str,
+    ) -> String {
+        fs::write(repo.join(file), contents).unwrap();
+        run_git(repo, ["add", file]);
+
+        let mut message = subject.to_string();
+        if !body.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(body);
+        }
+
+        let output = ProcessCommand::new("git")
+            .args(["commit", "--date", date, "-m", &message])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = ProcessCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn decoded_deep_link_query(link: &str) -> Vec<(String, String)> {

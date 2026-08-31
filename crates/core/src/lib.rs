@@ -1772,6 +1772,7 @@ const TEMPORAL_SUBJECT_STOP_WORDS: &[&str] = &[
     "shows",
     "shown",
     "actually",
+    "activity",
     "that",
     "s",
     "completed",
@@ -1862,9 +1863,15 @@ fn normalize_project_latest_query_words(words: &[String]) -> String {
 }
 
 fn normalize_temporal_subject_query_words(words: &[String]) -> String {
-    normalize_ask_query_words(words)
-        .split_whitespace()
-        .filter(|word| !TEMPORAL_SUBJECT_STOP_WORDS.contains(word) && word.parse::<u32>().is_err())
+    words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| {
+            !ASK_STOP_WORDS.contains(word)
+                && !ASK_EMPTY_QUERY_FALLBACK_STOP_WORDS.contains(word)
+                && !TEMPORAL_SUBJECT_STOP_WORDS.contains(word)
+                && word.parse::<u32>().is_err()
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -2604,28 +2611,42 @@ mod tests {
 
     #[test]
     fn retrieval_planner_keeps_generic_today_questions_broad() {
-        let plan = RetrievalPlanner::new().plan("What did I accomplish today?");
+        for question in [
+            "What did I do today?",
+            "Summarize my activity today.",
+            "What did I accomplish today?",
+        ] {
+            let plan = RetrievalPlanner::new().plan(question);
 
-        assert_eq!(
-            plan,
-            RetrievalPlan::Timeline {
-                range: DateRange::Today,
-                query: String::new()
-            }
-        );
+            assert_eq!(
+                plan,
+                RetrievalPlan::Timeline {
+                    range: DateRange::Today,
+                    query: String::new()
+                },
+                "{question}"
+            );
+        }
     }
 
     #[test]
     fn retrieval_planner_preserves_other_named_entities_for_today_questions() {
-        let plan = RetrievalPlanner::new().plan("Did I finish recall-indexer today?");
+        for (question, query) in [
+            ("What did I do with disk-guard today?", "disk guard"),
+            ("What did I finish in Recall today?", "recall"),
+            ("Did I finish recall-indexer today?", "recall indexer"),
+        ] {
+            let plan = RetrievalPlanner::new().plan(question);
 
-        assert_eq!(
-            plan,
-            RetrievalPlan::Timeline {
-                range: DateRange::Today,
-                query: "recall indexer".to_string()
-            }
-        );
+            assert_eq!(
+                plan,
+                RetrievalPlan::Timeline {
+                    range: DateRange::Today,
+                    query: query.to_string()
+                },
+                "{question}"
+            );
+        }
     }
 
     #[test]

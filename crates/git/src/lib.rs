@@ -1,8 +1,8 @@
 //! Git source adapter.
 //!
-//! This adapter reads commit history from the current repository through the
+//! This adapter reads commit history from configured repositories through the
 //! `git` executable. It intentionally does no indexing, caching, ranking, or
-//! repository discovery beyond the configured working directory.
+//! repository discovery beyond the configured working directories.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,7 +15,7 @@ use recall_core::{
 /// Adapter for the current Git repository.
 #[derive(Clone, Debug)]
 pub struct GitAdapter {
-    repo_dir: PathBuf,
+    repo_dirs: Vec<PathBuf>,
 }
 
 impl Default for GitAdapter {
@@ -28,22 +28,39 @@ impl GitAdapter {
     /// Creates a Git adapter pointed at the current working directory.
     pub fn new() -> Self {
         Self {
-            repo_dir: PathBuf::from("."),
+            repo_dirs: vec![PathBuf::from(".")],
         }
     }
 
     /// Creates a Git adapter pointed at an explicit repository directory.
     pub fn with_repo_dir(repo_dir: impl Into<PathBuf>) -> Self {
         Self {
-            repo_dir: repo_dir.into(),
+            repo_dirs: vec![repo_dir.into()],
         }
+    }
+
+    /// Creates a Git adapter pointed at explicit repository directories.
+    pub fn with_repo_dirs(repo_dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        let repo_dirs = repo_dirs.into_iter().collect();
+        Self { repo_dirs }
     }
 
     /// Reads commits from the configured repository.
     pub fn scan(&self) -> AdapterResult<Vec<Event>> {
-        let output = self.git(["log", "--format=%H%x1f%cI%x1f%s%x1f%b%x1e", "--no-color"])?;
+        let mut events = Vec::new();
+        for repo_dir in &self.repo_dirs {
+            let output = match self.git(
+                repo_dir,
+                ["log", "--format=%H%x1f%cI%x1f%s%x1f%b%x1e", "--no-color"],
+            ) {
+                Ok(output) => output,
+                Err(error) if is_unborn_head_error(&error.message) => continue,
+                Err(error) => return Err(error),
+            };
+            events.extend(parse_events(&output, repo_dir));
+        }
 
-        Ok(parse_events(&output))
+        Ok(events)
     }
 
     fn inspect_commit(&self, id: &EventId) -> AdapterResult<Event> {
@@ -51,22 +68,38 @@ impl GitAdapter {
             return Err(self.error("commit SHA is empty"));
         }
 
-        let output = self.git([
-            "show",
-            "--quiet",
-            "--format=%H%x1f%cI%x1f%s%x1f%b",
-            "--no-color",
-            id.as_str(),
-        ])?;
+        let mut missing_errors = Vec::new();
+        for repo_dir in &self.repo_dirs {
+            let output = self.git(
+                repo_dir,
+                [
+                    "show",
+                    "--quiet",
+                    "--format=%H%x1f%cI%x1f%s%x1f%b",
+                    "--no-color",
+                    id.as_str(),
+                ],
+            );
+            match output {
+                Ok(output) => {
+                    return parse_event(output.trim_end_matches('\n'), repo_dir)
+                        .ok_or_else(|| self.error(format!("commit not found: {}", id.as_str())));
+                }
+                Err(error) => missing_errors.push(error.message),
+            }
+        }
 
-        parse_event(output.trim_end_matches('\n'))
-            .ok_or_else(|| self.error(format!("commit not found: {}", id.as_str())))
+        let detail = missing_errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| format!("commit not found: {}", id.as_str()));
+        Err(self.error(detail))
     }
 
-    fn git<const N: usize>(&self, args: [&str; N]) -> AdapterResult<String> {
+    fn git<const N: usize>(&self, repo_dir: &PathBuf, args: [&str; N]) -> AdapterResult<String> {
         let output = Command::new("git")
             .args(args)
-            .current_dir(&self.repo_dir)
+            .current_dir(repo_dir)
             .output()
             .map_err(|error| self.error(format!("failed to run git: {error}")))?;
 
@@ -131,14 +164,14 @@ impl Adapter for GitAdapter {
     }
 }
 
-fn parse_events(output: &str) -> Vec<Event> {
+fn parse_events(output: &str, repo_dir: &PathBuf) -> Vec<Event> {
     output
         .split('\x1e')
-        .filter_map(|record| parse_event(record.trim_matches('\n')))
+        .filter_map(|record| parse_event(record.trim_matches('\n'), repo_dir))
         .collect()
 }
 
-fn parse_event(record: &str) -> Option<Event> {
+fn parse_event(record: &str, repo_dir: &PathBuf) -> Option<Event> {
     if record.is_empty() {
         return None;
     }
@@ -156,9 +189,19 @@ fn parse_event(record: &str) -> Option<Event> {
     let mut event = Event::new(EventId::new(sha), Source::Git, subject);
     event.timestamp = (!timestamp.is_empty()).then(|| Timestamp::new(timestamp));
     event.description = body.trim_end().to_string();
-    event.metadata = Metadata::from([("sha".to_string(), sha.to_string())]);
+    event.metadata = Metadata::from([
+        ("repository".to_string(), repo_dir.display().to_string()),
+        ("sha".to_string(), sha.to_string()),
+    ]);
 
     Some(event)
+}
+
+fn is_unborn_head_error(message: &str) -> bool {
+    message.contains("does not have any commits yet")
+        || (message.contains("your current branch")
+            && message.contains("does not have any commits"))
+        || message.contains("Needed a single revision")
 }
 
 fn search_event(event: Event, query_lower: &str, terms: &[&str]) -> Option<SearchResult> {
@@ -433,6 +476,135 @@ mod tests {
             .map(|event| event.title.as_str())
             .collect();
         assert_eq!(titles, vec!["Newer commit", "Older commit"]);
+    }
+
+    #[test]
+    fn timeline_can_read_multiple_repositories() {
+        let first_repo = temp_repo("timeline-multi-first");
+        let second_repo = temp_repo("timeline-multi-second");
+        let first_sha = commit_with_date(
+            &first_repo,
+            "first.txt",
+            "first",
+            "First repo commit",
+            "",
+            "2026-07-20T10:00:00Z",
+        );
+        let second_sha = commit_with_date(
+            &second_repo,
+            "second.txt",
+            "second",
+            "Second repo commit",
+            "",
+            "2026-07-20T11:00:00Z",
+        );
+
+        let timeline = GitAdapter::with_repo_dirs([first_repo.clone(), second_repo.clone()])
+            .timeline()
+            .unwrap();
+
+        assert_eq!(
+            timeline
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_sha.as_str(), first_sha.as_str()]
+        );
+        let first_repo = first_repo.display().to_string();
+        let second_repo = second_repo.display().to_string();
+        assert_eq!(
+            timeline.events[0]
+                .metadata
+                .get("repository")
+                .map(String::as_str),
+            Some(second_repo.as_str())
+        );
+        assert_eq!(
+            timeline.events[1]
+                .metadata
+                .get("repository")
+                .map(String::as_str),
+            Some(first_repo.as_str())
+        );
+    }
+
+    #[test]
+    fn timeline_skips_empty_repositories_without_aborting_other_repositories() {
+        let committed_repo = temp_repo("timeline-committed");
+        let empty_repo = temp_repo("timeline-empty");
+        let sha = commit_with_date(
+            &committed_repo,
+            "work.txt",
+            "work",
+            "Implement multi-repo timeline retrieval",
+            "The empty sibling repository should not abort Git timeline retrieval.",
+            "2026-08-31T09:00:00Z",
+        );
+
+        let timeline = GitAdapter::with_repo_dirs([committed_repo.clone(), empty_repo])
+            .timeline()
+            .unwrap();
+
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].id.as_str(), sha);
+        let committed_repo = committed_repo.display().to_string();
+        assert_eq!(
+            timeline.events[0]
+                .metadata
+                .get("repository")
+                .map(String::as_str),
+            Some(committed_repo.as_str())
+        );
+    }
+
+    #[test]
+    fn timeline_does_not_suppress_non_history_git_failures() {
+        let committed_repo = temp_repo("timeline-committed-before-failure");
+        commit_with_date(
+            &committed_repo,
+            "work.txt",
+            "work",
+            "Implement multi-repo timeline retrieval",
+            "",
+            "2026-08-31T09:00:00Z",
+        );
+        let non_repo = std::env::temp_dir().join(format!(
+            "recall-git-non-repo-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&non_repo).unwrap();
+
+        let error = GitAdapter::with_repo_dirs([committed_repo, non_repo])
+            .timeline()
+            .unwrap_err();
+
+        assert_eq!(error.source, Source::Git);
+        assert!(!is_unborn_head_error(&error.message));
+    }
+
+    #[test]
+    fn inspect_checks_each_configured_repository() {
+        let first_repo = temp_repo("inspect-multi-first");
+        let second_repo = temp_repo("inspect-multi-second");
+        commit(&first_repo, "first.txt", "first", "First repo commit", "");
+        let second_sha = commit(
+            &second_repo,
+            "second.txt",
+            "second",
+            "Second repo commit",
+            "",
+        );
+
+        let event = GitAdapter::with_repo_dirs([first_repo, second_repo])
+            .inspect(&EventId::new(second_sha))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.title, "Second repo commit");
     }
 
     #[test]
