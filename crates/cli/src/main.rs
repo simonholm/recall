@@ -17,9 +17,9 @@ use recall_codex::CodexAdapter;
 use recall_core::ContextCompiler;
 use recall_core::{
     annotate_search_results, compile_ask_evidence, project_metadata_matches_query_text,
-    AdapterCallTiming, DateRange, Event, EventId, EventRef, EvidenceBlock, PromptBuilder, Recall,
-    RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch, SearchQuery, SearchResult,
-    Source, Timeline, TimelineDiagnostics, ASK_RESULT_LIMIT,
+    timeline_events, AdapterCallTiming, DateRange, Event, EventId, EventRef, EvidenceBlock,
+    PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch,
+    SearchQuery, SearchResult, Source, Timeline, TimelineDiagnostics, ASK_RESULT_LIMIT,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -1049,31 +1049,12 @@ fn ask_retrieval_with_timings(
             } = timeline.diagnostics;
 
             let filter_started = Instant::now();
-            let in_range: Vec<_> = timeline
-                .timeline
-                .events
-                .into_iter()
-                .filter(|event| {
-                    event
-                        .timestamp
-                        .as_ref()
-                        .is_some_and(|timestamp| range.contains_timestamp(timestamp))
-                })
-                .collect();
-            let narrowed: Vec<_> = in_range
-                .iter()
-                .filter(|event| event_matches_query(event, query))
-                .cloned()
-                .collect();
-            let events = if narrowed.is_empty() {
-                in_range
-            } else {
-                narrowed
-            };
-            let events = match range {
-                DateRange::Day(_) => events,
-                _ => events.into_iter().take(ASK_RESULT_LIMIT).collect(),
-            };
+            let events = timeline_events(
+                timeline.timeline.events,
+                range,
+                query,
+                chrono::Local::now().date_naive(),
+            );
             let filter_limit_ms = elapsed_ms(filter_started);
             let returned_events = events.len();
 
@@ -1123,71 +1104,12 @@ fn ask_timeline_events(
     range: &DateRange,
     query: &str,
 ) -> Result<Vec<Event>, String> {
-    let in_range: Vec<_> = recall
-        .timeline()
-        .map_err(|error| error.to_string())?
-        .events
-        .into_iter()
-        .filter(|event| {
-            event
-                .timestamp
-                .as_ref()
-                .is_some_and(|timestamp| range.contains_timestamp(timestamp))
-        })
-        .collect();
-    let narrowed: Vec<_> = in_range
-        .iter()
-        .filter(|event| event_matches_query(event, query))
-        .cloned()
-        .collect();
-    let events = if narrowed.is_empty() {
-        in_range
-    } else {
-        narrowed
-    };
-
-    match range {
-        DateRange::Day(_) => Ok(events),
-        _ => Ok(events.into_iter().take(ASK_RESULT_LIMIT).collect()),
-    }
-}
-
-fn event_matches_query(event: &Event, query: &str) -> bool {
-    let query_terms = normalized_query_terms(query);
-    if query_terms.is_empty() {
-        return true;
-    }
-
-    let mut haystack = String::new();
-    haystack.push_str(&event.title);
-    haystack.push(' ');
-    haystack.push_str(&event.description);
-    for (key, value) in &event.metadata {
-        haystack.push(' ');
-        haystack.push_str(key);
-        haystack.push(' ');
-        haystack.push_str(value);
-    }
-    let haystack_terms = normalized_query_terms(&haystack);
-
-    query_terms.iter().all(|term| {
-        haystack_terms
-            .iter()
-            .any(|haystack_term| haystack_term == term)
-    })
-}
-
-fn normalized_query_terms(text: &str) -> Vec<String> {
-    let mut normalized = String::new();
-    for character in text.chars() {
-        if character.is_alphanumeric() || character.is_whitespace() {
-            normalized.extend(character.to_lowercase());
-        } else {
-            normalized.push(' ');
-        }
-    }
-
-    normalized.split_whitespace().map(str::to_string).collect()
+    Ok(timeline_events(
+        recall.timeline().map_err(|error| error.to_string())?.events,
+        range,
+        query,
+        chrono::Local::now().date_naive(),
+    ))
 }
 
 #[cfg(test)]

@@ -2482,7 +2482,9 @@ fn normalized_query_terms(text: &str) -> Vec<String> {
     normalized.split_whitespace().map(str::to_string).collect()
 }
 
-fn timeline_events(
+/// Filters timeline events for ask retrieval using date range, optional subject
+/// narrowing, and the broad in-range fallback.
+pub fn timeline_events(
     events: Vec<Event>,
     range: &DateRange,
     query: &str,
@@ -4102,6 +4104,56 @@ mod tests {
 
         assert_eq!(retrieval.events.len(), 1);
         assert_eq!(retrieval.events[0].id.as_str(), "today-event");
+    }
+
+    #[test]
+    fn broad_typo_today_question_keeps_in_range_timeline_evidence() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let mut event = Event::new(
+            "today-event",
+            Source::Codex,
+            "Investigated Recall retrieval",
+        );
+        event.timestamp = Some(Timestamp::new("2026-09-01T09:00:00Z"));
+        event.description = "Traced timeline fallback behavior.".to_string();
+        let mut recall = Recall::new();
+        recall.register(StaticAdapter::new_with_event(Source::Codex, event));
+
+        let plan = RetrievalPlanner::new().plan("whst hsve I done today?");
+        let retrieval = recall.ask_retrieval_on(&plan, today).unwrap();
+        let evidence = compile_ask_evidence(&plan, "whst hsve I done today?", &retrieval.events);
+
+        assert_eq!(retrieval.events.len(), 1);
+        assert_eq!(retrieval.events[0].id.as_str(), "today-event");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id.as_str(), "today-event");
+    }
+
+    #[test]
+    fn explicit_meaningful_today_subject_still_narrows_timeline_evidence() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let mut recall_event = Event::new("recall", Source::Codex, "Finished Recall retrieval");
+        recall_event.timestamp = Some(Timestamp::new("2026-09-01T09:00:00Z"));
+        recall_event.description = "Fixed Recall timeline subject handling.".to_string();
+        let mut disk_event = Event::new("disk-agent", Source::Codex, "Finished disk-agent work");
+        disk_event.timestamp = Some(Timestamp::new("2026-09-01T10:00:00Z"));
+        disk_event.description = "Validated disk-agent output.".to_string();
+        let mut recall = Recall::new();
+        recall.register(StaticAdapter::new_with_event(Source::Codex, recall_event));
+        recall.register(StaticAdapter::new_with_event(Source::Codex, disk_event));
+
+        let plan = RetrievalPlanner::new().plan("What did I finish in Recall today?");
+        let retrieval = recall.ask_retrieval_on(&plan, today).unwrap();
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Timeline {
+                range: DateRange::Today,
+                query: "recall".to_string()
+            }
+        );
+        assert_eq!(retrieval.events.len(), 1);
+        assert_eq!(retrieval.events[0].id.as_str(), "recall");
     }
 
     #[test]

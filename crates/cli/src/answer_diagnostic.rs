@@ -4,8 +4,8 @@ use super::{
 };
 use chrono::{DateTime, FixedOffset};
 use recall_core::{
-    Adapter, AdapterResult, Event, EventId, EventRef, Metadata, PromptBuilder, Recall,
-    RetrievalPlan, RetrievalPlanner, SearchResult, Source, Timeline, Timestamp,
+    timeline_events, Adapter, AdapterResult, Event, EventId, EventRef, Metadata, PromptBuilder,
+    Recall, RetrievalPlan, RetrievalPlanner, SearchResult, Source, Timeline, Timestamp,
 };
 use serde_json::Value;
 use std::fmt::Write;
@@ -269,33 +269,24 @@ fn diagnostic_events_as_of(
             Ok(events)
         }
         RetrievalPlan::Timeline { range, query } => {
-            let in_range: Vec<_> = recall
+            let candidates: Vec<_> = recall
                 .timeline()
                 .map_err(|error| error.to_string())?
                 .events
                 .into_iter()
                 .filter(|event| {
-                    event.timestamp.as_ref().is_some_and(|timestamp| {
-                        range.contains_timestamp(timestamp)
-                            && timestamp_is_at_or_before(timestamp, as_of)
-                    })
+                    event
+                        .timestamp
+                        .as_ref()
+                        .is_some_and(|timestamp| timestamp_is_at_or_before(timestamp, as_of))
                 })
                 .collect();
-            let narrowed: Vec<_> = in_range
-                .iter()
-                .filter(|event| super::event_matches_query(event, query))
-                .cloned()
-                .collect();
-            let events = if narrowed.is_empty() {
-                in_range
-            } else {
-                narrowed
-            };
-
-            match range {
-                recall_core::DateRange::Day(_) => Ok(events),
-                _ => Ok(events.into_iter().take(super::ASK_RESULT_LIMIT).collect()),
-            }
+            Ok(timeline_events(
+                candidates,
+                range,
+                query,
+                as_of.date_naive(),
+            ))
         }
     }
 }
@@ -791,6 +782,35 @@ fn answer_diagnostic_as_of_excludes_newer_timeline_events() {
 
     assert!(prompt.contains("Historical timeline retained marker."));
     assert!(!prompt.contains("Newer timeline diagnostic marker."));
+}
+
+#[test]
+fn answer_diagnostic_today_timeline_uses_historical_as_of_date() {
+    let mut recall = Recall::new();
+    let source = Source::Other("test".to_string());
+    recall.register(FixtureAdapter::new(
+        source.clone(),
+        vec![diagnostic_event(
+            &source,
+            "historical-today",
+            "historical today event",
+            "Decision: Historical today retained marker.",
+            "2026-07-20T12:00:00Z",
+        )],
+    ));
+    let case = AnswerEvalCase {
+        id: "timeline-today".to_string(),
+        question: "What did I work on today?".to_string(),
+        as_of: Some(DateTime::parse_from_rfc3339("2026-07-20T12:51:00Z").unwrap()),
+        expected_facts: vec![ExpectedFact {
+            name: "historical today".to_string(),
+            phrases: vec!["historical today retained marker".to_string()],
+        }],
+    };
+
+    let prompt = build_actual_ask_prompt(&recall, &case).unwrap();
+
+    assert!(prompt.contains("Historical today retained marker."));
 }
 
 #[test]
