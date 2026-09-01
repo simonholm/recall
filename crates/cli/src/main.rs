@@ -17,9 +17,10 @@ use recall_codex::CodexAdapter;
 use recall_core::ContextCompiler;
 use recall_core::{
     annotate_search_results, compile_ask_evidence, project_metadata_matches_query_text,
-    timeline_events, AdapterCallTiming, DateRange, Event, EventId, EventRef, EvidenceBlock,
-    PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner, SearchDiagnostics, SearchMatch,
-    SearchQuery, SearchResult, Source, Timeline, TimelineDiagnostics, ASK_RESULT_LIMIT,
+    select_ask_search_matches, timeline_events, AdapterCallTiming, DateRange, Event, EventId,
+    EventRef, EvidenceBlock, PromptBuilder, Recall, RetrievalPlan, RetrievalPlanner,
+    SearchDiagnostics, SearchMatch, SearchQuery, SearchResult, Source, Timeline,
+    TimelineDiagnostics, ASK_RESULT_LIMIT,
 };
 use recall_git::GitAdapter;
 use std::fmt::Write;
@@ -969,8 +970,7 @@ fn ask_retrieval_with_timings(
             } = search.diagnostics;
 
             let limit_started = Instant::now();
-            let search_matches: Vec<_> =
-                search.results.into_iter().take(ASK_RESULT_LIMIT).collect();
+            let search_matches = select_ask_search_matches(query, search.results);
             let limit_ms = elapsed_ms(limit_started);
 
             let returned_results = search_matches.len();

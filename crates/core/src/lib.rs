@@ -1961,6 +1961,7 @@ fn search_intent(words: &[String]) -> SearchIntent {
     }
     if contains_word(words, "landed")
         || contains_word_sequence(words, &["when", "did", "i", "implement"])
+        || contains_completed_change_question(words)
     {
         return SearchIntent::CompletedChange;
     }
@@ -1984,10 +1985,63 @@ fn search_intent_terms(words: &[String], intent: SearchIntent) -> Vec<String> {
             SearchIntent::CompletedChange if contains_word(words, "landed") => {
                 matches!(word.as_str(), "actually" | "change" | "landed")
             }
+            SearchIntent::CompletedChange if contains_completed_change_question(words) => {
+                matches!(
+                    word.as_str(),
+                    "actually"
+                        | "change"
+                        | "changing"
+                        | "complete"
+                        | "completed"
+                        | "finish"
+                        | "finished"
+                )
+            }
             SearchIntent::CompletedChange => word.as_str() == "implement",
         })
         .cloned()
         .collect()
+}
+
+fn contains_completed_change_question(words: &[String]) -> bool {
+    contains_completion_question_prefix(words)
+        && (completion_verb_before_change(words) || completion_verb_before_changing(words))
+        || passive_change_completed_question(words)
+}
+
+fn contains_completion_question_prefix(words: &[String]) -> bool {
+    contains_word_sequence(words, &["did", "i"])
+        || contains_word_sequence(words, &["have", "i"])
+        || contains_word_sequence(words, &["has", "it"])
+}
+
+fn completion_verb_before_change(words: &[String]) -> bool {
+    let Some(verb_index) = words.iter().position(|word| {
+        matches!(
+            word.as_str(),
+            "complete" | "completed" | "finish" | "finished"
+        )
+    }) else {
+        return false;
+    };
+
+    words
+        .iter()
+        .skip(verb_index + 1)
+        .any(|word| word == "change")
+}
+
+fn completion_verb_before_changing(words: &[String]) -> bool {
+    words.windows(2).any(|window| {
+        matches!(window[0].as_str(), "complete" | "finish") && window[1] == "changing"
+    })
+}
+
+fn passive_change_completed_question(words: &[String]) -> bool {
+    contains_word(words, "was")
+        && words.windows(2).any(|window| {
+            window[0] == "change" && matches!(window[1].as_str(), "complete" | "completed")
+        })
 }
 
 fn normalize_project_latest_query_words(words: &[String]) -> String {
@@ -2357,11 +2411,8 @@ impl Recall {
     ) -> AdapterResult<AskRetrieval> {
         match plan {
             RetrievalPlan::Search { query } => {
-                let mut search_matches = self
-                    .search_events(query.subject())?
-                    .into_iter()
-                    .take(ASK_RESULT_LIMIT)
-                    .collect::<Vec<_>>();
+                let mut search_matches =
+                    select_ask_search_matches(query, self.search_events(query.subject())?);
                 annotate_search_matches(query, &mut search_matches);
                 let (search_results, events) = split_search_matches(search_matches);
                 Ok(AskRetrieval {
@@ -2385,6 +2436,45 @@ impl Recall {
             }
         }
     }
+}
+
+/// Applies ask Search plan-specific candidate selection before context compilation.
+pub fn select_ask_search_matches(
+    query: &SearchQuery,
+    search_matches: Vec<SearchMatch>,
+) -> Vec<SearchMatch> {
+    prefer_project_owned_completed_change_matches(query, search_matches)
+        .into_iter()
+        .take(ASK_RESULT_LIMIT)
+        .collect()
+}
+
+fn prefer_project_owned_completed_change_matches(
+    query: &SearchQuery,
+    search_matches: Vec<SearchMatch>,
+) -> Vec<SearchMatch> {
+    if query.intent() != SearchIntent::CompletedChange {
+        return search_matches;
+    }
+
+    let query_terms = normalize_question_words(query.subject());
+    if query_terms.is_empty()
+        || !search_matches
+            .iter()
+            .any(|search_match| search_match_project_matches(search_match, &query_terms))
+    {
+        return search_matches;
+    }
+
+    search_matches
+        .into_iter()
+        .filter(|search_match| search_match_project_matches(search_match, &query_terms))
+        .collect()
+}
+
+fn search_match_project_matches(search_match: &SearchMatch, query_terms: &[String]) -> bool {
+    project_metadata_matches_query(&search_match.event.metadata, query_terms)
+        || project_metadata_matches_query(&search_match.result.metadata, query_terms)
 }
 
 /// Compiles ask retrieval events with the same plan-specific compiler branch as the CLI.
@@ -2643,6 +2733,11 @@ mod tests {
         score: Option<u32>,
     }
 
+    #[derive(Debug)]
+    struct LexicalAdapter {
+        events: Vec<Event>,
+    }
+
     impl StaticAdapter {
         fn new(source: Source, id: &str, title: &str) -> Self {
             Self {
@@ -2701,6 +2796,66 @@ mod tests {
 
         fn inspect(&self, id: &EventId) -> AdapterResult<Option<Event>> {
             Ok((id == &self.event.id).then(|| self.event.clone()))
+        }
+    }
+
+    impl LexicalAdapter {
+        fn new(events: Vec<Event>) -> Self {
+            Self { events }
+        }
+    }
+
+    impl Adapter for LexicalAdapter {
+        fn source(&self) -> Source {
+            Source::Other("test".to_string())
+        }
+
+        fn search(&self, query: &str) -> AdapterResult<Vec<SearchResult>> {
+            Ok(self
+                .search_events(query)?
+                .into_iter()
+                .map(|search_match| search_match.result)
+                .collect())
+        }
+
+        fn search_events(&self, query: &str) -> AdapterResult<Vec<SearchMatch>> {
+            let terms = query.split_whitespace().collect::<Vec<_>>();
+            let matches = self
+                .events
+                .iter()
+                .filter(|event| {
+                    let haystack = format!("{} {}", event.title, event.description).to_lowercase();
+                    terms.iter().all(|term| haystack.contains(term))
+                })
+                .map(|event| {
+                    let score = event
+                        .metadata
+                        .get("test_score")
+                        .and_then(|score| score.parse::<u32>().ok())
+                        .unwrap_or((terms.len() as u32) * 10);
+                    SearchMatch {
+                        result: SearchResult {
+                            event: EventRef::new(event.source.clone(), event.id.clone()),
+                            score: Some(score),
+                            snippet: query.to_string(),
+                            metadata: event.metadata.clone(),
+                            diagnostics: Metadata::new(),
+                        },
+                        event: event.clone(),
+                    }
+                })
+                .collect();
+            Ok(matches)
+        }
+
+        fn timeline(&self) -> AdapterResult<Timeline> {
+            Ok(Timeline {
+                events: self.events.clone(),
+            })
+        }
+
+        fn inspect(&self, id: &EventId) -> AdapterResult<Option<Event>> {
+            Ok(self.events.iter().find(|event| event.id == *id).cloned())
         }
     }
 
@@ -2857,6 +3012,22 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_planner_keeps_rationale_precedence_over_finished_change_words() {
+        let plan = RetrievalPlanner::new().plan("Why did the change detector finish early?");
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "change detector finish early".to_string(),
+                    intent: SearchIntent::Rationale,
+                    intent_terms: vec!["why".to_string()]
+                }
+            }
+        );
+    }
+
+    #[test]
     fn retrieval_planner_splits_completed_change_search_subject_and_intent() {
         let plan = RetrievalPlanner::new().plan("What EventRef change actually landed?");
 
@@ -2874,6 +3045,46 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn retrieval_planner_splits_finished_change_search_subject_and_intent() {
+        for (question, subject, intent_terms) in [
+            (
+                "Did I actually finish the cache-sentinel change?",
+                "cache sentinel",
+                vec!["actually", "finish", "change"],
+            ),
+            (
+                "Was the cache-sentinel change completed?",
+                "cache sentinel",
+                vec!["change", "completed"],
+            ),
+            (
+                "Did I finish changing the parser?",
+                "parser",
+                vec!["finish", "changing"],
+            ),
+            (
+                "Did I complete changing the cache format?",
+                "cache format",
+                vec!["complete", "changing"],
+            ),
+        ] {
+            let plan = RetrievalPlanner::new().plan(question);
+
+            assert_eq!(
+                plan,
+                RetrievalPlan::Search {
+                    query: SearchQuery {
+                        subject: subject.to_string(),
+                        intent: SearchIntent::CompletedChange,
+                        intent_terms: intent_terms.into_iter().map(str::to_string).collect()
+                    }
+                },
+                "{question}"
+            );
+        }
     }
 
     #[test]
@@ -2910,6 +3121,22 @@ mod tests {
             (
                 "What changed in the change detector?",
                 SearchQuery::plain("changed change detector"),
+            ),
+            (
+                "Did I finish parser notes?",
+                SearchQuery::plain("finish parser notes"),
+            ),
+            (
+                "What is the complete change detection algorithm?",
+                SearchQuery::plain("complete change detection algorithm"),
+            ),
+            (
+                "How does finished-change parsing work?",
+                SearchQuery::plain("finished change parsing"),
+            ),
+            (
+                "What changed after I finished the migration?",
+                SearchQuery::plain("changed after finished migration"),
             ),
         ] {
             let plan = RetrievalPlanner::new().plan(question);
@@ -4084,6 +4311,128 @@ mod tests {
                 .map(String::as_str),
             Some("change actually landed")
         );
+    }
+
+    #[test]
+    fn recall_ask_completed_change_recovers_current_project_evidence() {
+        let mut commit = Event::new(
+            "commit-1",
+            Source::Git,
+            "Initial cache-sentinel implementation",
+        );
+        commit.metadata.insert(
+            "repository".to_string(),
+            "/home/simon/labs/repos/cache-sentinel".to_string(),
+        );
+        commit
+            .metadata
+            .insert("test_score".to_string(), "20".to_string());
+
+        let mut unrelated_discussion = Event::new(
+            "discussion-1",
+            Source::Codex,
+            "Did I actually finish the cache-sentinel change?",
+        );
+        unrelated_discussion.description =
+            "Discussed how Recall should answer completed-change questions.".to_string();
+        unrelated_discussion.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/recall".to_string(),
+        );
+        unrelated_discussion
+            .metadata
+            .insert("test_score".to_string(), "500".to_string());
+
+        let mut recall = Recall::new();
+        recall.register(LexicalAdapter::new(vec![unrelated_discussion, commit]));
+
+        let plan = RetrievalPlanner::new().plan("Did I actually finish the cache-sentinel change?");
+        let retrieval = recall.ask_retrieval(&plan).unwrap();
+        let evidence = compile_ask_evidence(
+            &plan,
+            "Did I actually finish the cache-sentinel change?",
+            &retrieval.events,
+        );
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery {
+                    subject: "cache sentinel".to_string(),
+                    intent: SearchIntent::CompletedChange,
+                    intent_terms: vec![
+                        "actually".to_string(),
+                        "finish".to_string(),
+                        "change".to_string()
+                    ]
+                }
+            }
+        );
+        assert_eq!(
+            retrieval.search_results[0].event,
+            EventRef::new(Source::Git, "commit-1")
+        );
+        assert_eq!(
+            retrieval.search_results[0]
+                .diagnostics
+                .get("project_metadata_boost")
+                .map(String::as_str),
+            Some("1000")
+        );
+        assert!(retrieval
+            .search_results
+            .iter()
+            .all(|result| result.event != EventRef::new(Source::Codex, "discussion-1")));
+        assert!(evidence
+            .iter()
+            .any(|block| block.source == Source::Git && block.id.as_str() == "commit-1"));
+    }
+
+    #[test]
+    fn recall_ask_plain_project_question_keeps_project_ownership_behavior() {
+        let mut current_project = Event::new(
+            "current-project",
+            Source::Codex,
+            "Explain cache-sentinel behavior",
+        );
+        current_project.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/cache-sentinel".to_string(),
+        );
+        current_project
+            .metadata
+            .insert("test_score".to_string(), "20".to_string());
+
+        let mut unrelated = Event::new(
+            "unrelated",
+            Source::Codex,
+            "Explain cache-sentinel behavior",
+        );
+        unrelated.metadata.insert(
+            "cwd".to_string(),
+            "/home/simon/labs/repos/recall".to_string(),
+        );
+        unrelated
+            .metadata
+            .insert("test_score".to_string(), "500".to_string());
+
+        let mut recall = Recall::new();
+        recall.register(LexicalAdapter::new(vec![unrelated, current_project]));
+
+        let plan = RetrievalPlanner::new().plan("What is cache-sentinel?");
+        let retrieval = recall.ask_retrieval(&plan).unwrap();
+
+        assert_eq!(
+            plan,
+            RetrievalPlan::Search {
+                query: SearchQuery::plain("cache sentinel")
+            }
+        );
+        assert_eq!(
+            retrieval.search_results[0].event,
+            EventRef::new(Source::Codex, "current-project")
+        );
+        assert_eq!(retrieval.search_results.len(), 2);
     }
 
     #[test]
